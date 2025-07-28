@@ -1,0 +1,1 @@
+Change selection cursor mode to be more like greenshot, showing across a whole screen line and coordinates.
