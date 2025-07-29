@@ -1,3 +1,6 @@
 +Change selection cursor mode to be more like greenshot, showing across a whole screen line and coordinates.
 +Make it work on all screens
 +If folder fails to get created, provide an error.
+Make it possible for multiple installs
+In settings have adjustment for colours and size of lines for selection of area.
+In settings shortcut key 
