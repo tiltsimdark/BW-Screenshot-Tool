@@ -4,3 +4,4 @@
 Make it possible for multiple installs
 In settings have adjustment for colours and size of lines for selection of area.
 In settings shortcut key 
+If Folder name is empty, save it to the folder "Screenshots" with Master path
