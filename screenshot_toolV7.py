@@ -79,6 +79,13 @@ GEOMETRY_RE = re.compile(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)")
 # Platform helpers
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=None)
+def _win_dll(name):
+    """Our own handle to a Windows DLL, so the argument types we declare don't
+    change the shared ctypes.windll functions other libraries (screeninfo) use."""
+    return ctypes.WinDLL(name)
+
+
 def enable_dpi_awareness():
     """Ask Windows for real pixel coordinates.
 
@@ -89,21 +96,21 @@ def enable_dpi_awareness():
     if not IS_WINDOWS:
         return
     try:  # Windows 10 1703+: per-monitor v2
-        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+        if _win_dll("user32").SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
             return
     except Exception:
         pass
     try:  # Windows 8.1+: per-monitor
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        _win_dll("shcore").SetProcessDpiAwareness(2)
     except Exception:
         try:
-            ctypes.windll.user32.SetProcessDPIAware()
+            _win_dll("user32").SetProcessDPIAware()
         except Exception:
             pass
 
 
 def _windows_virtual_screen():
-    metric = ctypes.windll.user32.GetSystemMetrics
+    metric = _win_dll("user32").GetSystemMetrics
     return metric(76), metric(77), metric(78), metric(79)
 
 
@@ -194,7 +201,7 @@ def _copy_image_windows(image, owner=None):
     image.convert("RGB").save(buffer, "DIB")
     data = buffer.getvalue()
 
-    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    user32, kernel32 = _win_dll("user32"), _win_dll("kernel32")
     kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
     kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
     kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
@@ -451,7 +458,7 @@ class _WindowsHotkeys:
 
         ids = {}
         try:
-            user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+            user32, kernel32 = _win_dll("user32"), _win_dll("kernel32")
             user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
             user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
             user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
@@ -491,7 +498,7 @@ class _WindowsHotkeys:
         if self._thread and self._thread.is_alive() and self._thread_id:
             from ctypes import wintypes
 
-            post = ctypes.windll.user32.PostThreadMessageW
+            post = _win_dll("user32").PostThreadMessageW
             post.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
             post(self._thread_id, self.WM_QUIT, 0, 0)
             self._thread.join(1)
@@ -801,6 +808,7 @@ class Settings:
         self.path = Path(path) if path else app_directory() / SETTINGS_FILE  # preferred file
         self.saved_to = self.path  # where the last save actually went
         self.problem = None
+        self._path_writable = None  # checked once, again after a failed save
 
     def __getitem__(self, key):
         return self.values[key]
@@ -815,13 +823,21 @@ class Settings:
     @staticmethod
     def _writable(path):
         """Whether path can be written for good (a brief lock doesn't count)."""
-        if path.exists() and not os.access(path, os.W_OK):  # e.g. read-only attribute
-            return False
+        if path.exists():
+            try:
+                with open(path, "a"):
+                    pass
+            except OSError as error:
+                if getattr(error, "winerror", None) not in (32, 33):  # not just in use
+                    return False
         if not path.parent.is_dir():
             return False
-        try:  # e.g. Program Files: files can't be created there
-            with tempfile.TemporaryFile(dir=path.parent):
-                pass
+        probe = path.parent / f".{path.name}.{os.getpid()}.probe"
+        try:  # one attempt; e.g. Program Files doesn't let users create files
+            os.close(os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            os.unlink(probe)
+            return True
+        except FileExistsError:
             return True
         except OSError:
             return False
@@ -829,7 +845,11 @@ class Settings:
     def save_target(self):
         """The file the next save will write."""
         fallback = self._fallback()
-        return fallback if fallback and not self._writable(self.path) else self.path
+        if fallback is None:
+            return self.path
+        if self._path_writable is None:
+            self._path_writable = self._writable(self.path)
+        return self.path if self._path_writable else fallback
 
     def _source(self):
         fallback = self._fallback()
@@ -872,7 +892,8 @@ class Settings:
     def save(self):
         """Write next to the program, or to the user folder if that fails."""
         text = json.dumps(self.values, indent=4)
-        targets = [self.path] + ([self._fallback()] if self._fallback() else [])
+        target = self.save_target()
+        targets = [target] + ([self._fallback()] if self._fallback() and target != self._fallback() else [])
         error = None
         for target in targets:
             for attempt in range(3):
@@ -885,10 +906,13 @@ class Settings:
                     return
                 except OSError as exc:
                     error = exc
-                    # Windows sharing violations (antivirus, OneDrive) pass quickly.
-                    if getattr(exc, "winerror", None) in (32, 33) and attempt < 2:
+                    # The target passed the writability check, so this is most
+                    # likely a brief lock (antivirus, OneDrive, indexer): retry.
+                    if isinstance(exc, PermissionError) and attempt < 2:
                         time.sleep(0.05)
                         continue
+                    if target == self.path:
+                        self._path_writable = None  # look again next time
                     break
         raise error
 
@@ -1262,7 +1286,7 @@ def work_area(window, x, y):
                 _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
                             ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
 
-            user32 = ctypes.windll.user32
+            user32 = _win_dll("user32")
             user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
             user32.MonitorFromPoint.restype = wintypes.HANDLE
             user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
@@ -1275,18 +1299,22 @@ def work_area(window, x, y):
         except Exception:
             pass
     screen_w, screen_h = window.winfo_screenwidth(), window.winfo_screenheight()
+    if IS_MAC:  # Tk only knows the main display; don't move windows off other displays
+        inside = 0 <= x < screen_w and 0 <= y < screen_h
+        return (0, 0, screen_w, screen_h - UI.px(40)) if inside else None
     monitors = [(0, 0, screen_w, screen_h)]
-    if not IS_MAC:  # Tk on macOS only knows the main display; don't guess there
-        try:
-            import screeninfo
+    try:
+        import screeninfo
 
-            monitors = [(m.x, m.y, m.width, m.height) for m in screeninfo.get_monitors()] or monitors
-        except Exception:
-            pass
-    for mx, my, mw, mh in monitors:
-        if mx <= x < mx + mw and my <= y < my + mh:
-            return mx, my, mx + mw, my + mh - UI.px(40)  # room for a panel or dock
-    return None
+        monitors = [(m.x, m.y, m.width, m.height) for m in screeninfo.get_monitors()] or monitors
+    except Exception:
+        pass
+
+    def distance(monitor):  # 0 when (x, y) is on the monitor
+        mx, my, mw, mh = monitor
+        return max(mx - x, 0, x - (mx + mw - 1)) ** 2 + max(my - y, 0, y - (my + mh - 1)) ** 2
+    mx, my, mw, mh = min(monitors, key=distance)
+    return mx, my, mx + mw, my + mh - UI.px(40)  # room for a panel or dock
 
 
 def center_window(window, width, height, parent=None):
@@ -2085,7 +2113,7 @@ class ImageEditor:
             return
         point = self._to_image(event.x, event.y)
         width = max(1, round(self._size() * self.scale_x))
-        self.drag = {"tool": tool, "points": [point, point], "width": width,
+        self.drag = {"tool": tool, "points": [point, point], "width": width, "color": self.color.get(),
                      "item": self._preview_item(tool, width)}
         self._update_preview_item()
 
@@ -2113,11 +2141,18 @@ class ImageEditor:
             x0, y0, x1, y1 = coords[0], coords[1], coords[-2], coords[-1]
             left, right = sorted((x0, x1))
             top, bottom = sorted((y0, y1))
-            inset = drag["width"] / 2
-            if right - left > 2 * inset:
-                left, right = left + inset, right - inset
-            if bottom - top > 2 * inset:
-                top, bottom = top + inset, bottom - inset
+            stroke = drag["width"]
+            if right - left <= stroke or bottom - top <= stroke:  # the final shape comes out filled
+                self.canvas.itemconfigure(drag["item"], fill=drag["color"], width=0)
+                if drag["tool"] == "rect":  # Pillow grows a box smaller than its stroke
+                    if right - left <= stroke:
+                        left, right = min(left, right - stroke + 1), max(right, left + stroke - 1)
+                    if bottom - top <= stroke:
+                        top, bottom = min(top, bottom - stroke + 1), max(bottom, top + stroke - 1)
+            else:
+                self.canvas.itemconfigure(drag["item"], fill="", width=stroke)
+                inset = stroke / 2
+                left, top, right, bottom = left + inset, top + inset, right - inset, bottom - inset
             coords = [left, top, right, bottom]
         elif len(coords) == 2:
             coords *= 2
@@ -2545,11 +2580,11 @@ class SettingsDialog:
             return value if re.fullmatch(r"#[0-9a-fA-F]{6}", value) else "#FF0000"
 
         dim = self.vars["dim_percent"].get() / 100
-        scene = [((0, 0, width, height), "#CBD5E1"), ((px(20), px(14), px(170), px(110)), "#F8FAFC"),
-                 ((px(20), px(14), px(170), px(30)), "#93C5FD"), ((px(190), px(40), px(285), px(118)), "#E2E8F0")]
+        scene = [((0, 0, width, height), "#CBD5E1"), ((px(20), px(12), px(170), px(98)), "#F8FAFC"),
+                 ((px(20), px(12), px(170), px(26)), "#93C5FD"), ((px(190), px(34), px(285), px(100)), "#E2E8F0")]
         for box, fill in scene:
             canvas.create_rectangle(*box, fill=shade(fill, dim), outline="")
-        left, top, right, bottom = px(60), px(40), px(220), px(100)
+        left, top, right, bottom = px(60), px(34), px(220), px(88)
         for (x0, y0, x1, y1), fill in scene:
             x0, y0, x1, y1 = max(x0, left), max(y0, top), min(x1, right), min(y1, bottom)
             if x0 < x1 and y0 < y1:
@@ -2560,7 +2595,7 @@ class SettingsDialog:
             canvas.create_line(right, 0, right, height, fill=color("crosshair_color"), width=line)
         canvas.create_rectangle(left, top, right, bottom, outline=color("selection_color"),
                                 width=as_int("selection_width", 2))
-        label = canvas.create_text(left + px(4), top - px(18), text="160 × 60", anchor="nw",
+        label = canvas.create_text(left + px(4), top - px(18), text="160 × 54", anchor="nw",
                                    fill="white", font=UI.font(9, "bold"))
         x0, y0, x1, y1 = canvas.bbox(label)
         canvas.tag_lower(canvas.create_rectangle(x0 - 4, y0 - 2, x1 + 4, y1 + 2, fill="#111827", outline=""), label)
@@ -2696,6 +2731,7 @@ class ScreenshotApp:
         self._local_bindings = []
         self._hidden = []  # (window, how it was hidden, previous state) during a capture
         self._focus = ""
+        self._stack = []
         self._preview_id = None
         self.preview_photo = None
 
@@ -2763,7 +2799,10 @@ class ScreenshotApp:
         self.folder_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(row, text="Browse…", command=self.browse_folder).pack(side=tk.LEFT, padx=(px(6), 0))
         ttk.Button(row, text="Open", command=self.open_output_folder).pack(side=tk.LEFT, padx=(px(6), 0))
-        self.path_label = ttk.Label(card, style="CardMuted.TLabel", anchor="w", justify=tk.LEFT)
+        # A small wrap length while the window is measured, so a long folder path
+        # can't make the window wide; widened to the real width once shown.
+        self.path_label = ttk.Label(card, style="CardMuted.TLabel", anchor="w", justify=tk.LEFT,
+                                    wraplength=px(300))
         self.path_label.pack(fill=tk.X, pady=(px(3), 0))
         self.path_label.bind("<Configure>", lambda e: self.path_label.configure(wraplength=max(100, e.width)))
         options = ttk.Frame(card, style="Card.TFrame")
@@ -2854,7 +2893,11 @@ class ScreenshotApp:
         available_w, available_h = self._available_size()
         width = min(max(px(560), self._content_width), available_w)
         height = min(self._content_height + px(220), available_h)
-        root.geometry(f"{width}x{height}+{(screen_w - width) // 2}+{max(0, (screen_h - height) // 2 - 20)}")
+        left, top, right, _ = (work_area(root, screen_w // 2, screen_h // 2)
+                               or (0, 0, screen_w, screen_h - px(40)))
+        x = left + max(0, (right - left - width) // 2)
+        y = top + max(0, (available_h - height) // 2)
+        root.geometry(f"{width}x{height}+{x}+{y}")
 
     # -- status ------------------------------------------------------------
     def set_status(self, message, kind="info"):
@@ -3070,6 +3113,7 @@ class ScreenshotApp:
         are always withdrawn.
         """
         self._focus = str(self.root.tk.call("focus"))  # "" when another program is in front
+        self._stack = [str(path) for path in self.root.tk.call("wm", "stackorder", self.root)]
         self._hidden = []
         for window in [self.root] + [editor.win for editor in self.editors]:
             state = window.state()
@@ -3113,9 +3157,22 @@ class ScreenshotApp:
                 self.root.tk.call("focus", "-force", self._focus)
             except tk.TclError:
                 pass
-        else:  # another program was in front: stay behind it
-            for window in restored:
+        else:  # another program was in front: stay behind it, in the same order
+            order = {path: index for index, path in enumerate(self._stack)}
+            for window in sorted(restored, key=lambda w: order.get(str(w), 0), reverse=True):
                 window.lower()
+            if restored:
+                self.root.after(200, self._raise_if_focused)
+
+    def _raise_if_focused(self):
+        """Some window managers give a re-shown window the keyboard even when it is
+        lowered; then show it, so typing never goes into a hidden window."""
+        focus = str(self.root.tk.call("focus"))
+        if focus:
+            try:
+                self.root.tk.call("raise", self.root.tk.call("winfo", "toplevel", focus))
+            except tk.TclError:
+                pass
 
     def _bring_to_front(self):
         if self.root.state() in ("iconic", "withdrawn"):
