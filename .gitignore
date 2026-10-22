@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# Per-install settings written by the tool
+screenshot_settings.json
+screenshot_settings.json.*
