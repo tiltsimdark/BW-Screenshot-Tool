@@ -1,0 +1,5 @@
+Pillow>=9.1
+# Optional: "Enter" while selecting captures the monitor under the mouse.
+screeninfo>=0.8
+# Optional, Linux/macOS only: global hotkeys (Windows has them built in).
+pynput>=1.7; sys_platform != "win32"
