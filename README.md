@@ -10,11 +10,26 @@ are kept for reference.
 ## Install and run
 
 1. Install Python 3.8 or newer (on Windows tick *"Add python.exe to PATH"*).
-2. Install the packages:
+2. Install the packages with the same Python you will run the tool with.
+   The imaging package is called **Pillow** (`PIL` is only its import name):
 
    ```
-   pip install -r requirements.txt
+   python -m pip install Pillow screeninfo
    ```
+
+   If `pip` isn't found, use the full path to your Python, e.g.
+   `& C:\Users\<you>\.local\bin\python3.14.exe -m pip install Pillow screeninfo`.
+   If that reports *"externally-managed-environment"* or *"No module named pip"*
+   (common with Pythons installed by `uv`), give the tool its own environment:
+
+   ```
+   python -m venv bw-env
+   bw-env\Scripts\python.exe -m pip install Pillow screeninfo      (Linux/macOS: bw-env/bin/python)
+   ```
+
+   and start it with `bw-env\Scripts\pythonw.exe screenshot_toolV7.py`.
+   With `uv` installed, `uv run --with pillow --with screeninfo screenshot_toolV7.py`
+   also works without any setup.
 
 3. Start the tool:
 
@@ -46,7 +61,7 @@ same second the second one gets `_1` added, so nothing is ever overwritten.
 | Action | Hotkey | What it does |
 | --- | --- | --- |
 | Region | Print Screen | Freeze all screens and drag to select an area |
-| Last region | Shift + Print Screen | Capture the previous area again (or the X/Y/W/H you typed) |
+| Last region | Shift + Print Screen | Capture the previous area again, or the X/Y/W/H typed in the Region box |
 | Full screen | Ctrl + Print Screen | Capture every monitor in one image |
 
 The hotkeys work while other programs are in front and can be changed in

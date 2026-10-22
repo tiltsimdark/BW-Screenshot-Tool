@@ -48,6 +48,9 @@ class HotkeyTests(unittest.TestCase):
         self.assertIsNone(tool.hotkey_problem(tool.parse_hotkey("Ctrl+Q")))
         self.assertIsNone(tool.hotkey_problem(tool.parse_hotkey("Print")))
         self.assertIsNone(tool.hotkey_problem(tool.parse_hotkey("F9")))
+        for key in ("Delete", "Home", "End", "Insert", "PageUp", "PageDown", "Space"):
+            self.assertIsNotNone(tool.hotkey_problem(tool.parse_hotkey(key)), key)
+            self.assertIsNone(tool.hotkey_problem(tool.parse_hotkey("Ctrl+" + key)), key)
 
     def test_tk_sequences(self):
         self.assertEqual(tool.tk_sequence(tool.parse_hotkey("Print")), "<KeyPress-Print>")
@@ -177,12 +180,75 @@ class SettingsTests(unittest.TestCase):
             settings = tool.Settings()
             settings["master_folder"] = "/somewhere"
             settings.save()
-            self.assertEqual(settings.path, self.folder / "config" / tool.SETTINGS_FILE)
+            self.assertEqual(settings.saved_to, self.folder / "config" / tool.SETTINGS_FILE)
             again = tool.Settings()
             again.load()
             self.assertEqual(again["master_folder"], "/somewhere")
         finally:
             tool.app_directory, tool.user_config_directory = original
+
+    def test_one_failed_save_does_not_move_settings_for_good(self):
+        original = tool.app_directory, tool.user_config_directory
+        try:
+            program = self.folder / "program"
+            program.mkdir()
+            tool.app_directory = lambda: program
+            tool.user_config_directory = lambda: self.folder / "config"
+            settings = tool.Settings()
+            settings.save()
+            real_replace = tool.os.replace
+            calls = []
+
+            def flaky_replace(source, target):
+                if not calls and Path(target).parent == program:
+                    calls.append(target)
+                    raise OSError("locked")
+                return real_replace(source, target)
+            tool.os.replace = flaky_replace
+            try:
+                settings["master_folder"] = "/first"
+                settings.save()  # goes to the config folder once
+            finally:
+                tool.os.replace = real_replace
+            settings["master_folder"] = "/second"
+            settings.save()  # back next to the program
+            again = tool.Settings()
+            again.load()
+            self.assertEqual(again["master_folder"], "/second")
+            self.assertEqual(again.saved_to, program / tool.SETTINGS_FILE)
+        finally:
+            tool.app_directory, tool.user_config_directory = original
+
+    def test_new_copy_starts_from_shared_settings_but_saves_its_own(self):
+        original = tool.app_directory, tool.user_config_directory
+        try:
+            config = self.folder / "config"
+            config.mkdir()
+            (config / tool.SETTINGS_FILE).write_text(json.dumps({"master_folder": "/shared"}))
+            tool.user_config_directory = lambda: config
+            tool.app_directory = lambda: self.folder / "copy"
+            (self.folder / "copy").mkdir()
+            settings = tool.Settings()
+            settings.load()
+            self.assertEqual(settings["master_folder"], "/shared")
+            settings["master_folder"] = "/mine"
+            settings.save()
+            self.assertTrue((self.folder / "copy" / tool.SETTINGS_FILE).is_file())
+            self.assertIn("/shared", (config / tool.SETTINGS_FILE).read_text())
+        finally:
+            tool.app_directory, tool.user_config_directory = original
+
+    def test_infinite_numbers_cannot_stop_startup(self):
+        self.path.write_text('{"jpeg_quality": 1e999, "selection_width": Infinity, '
+                             '"dim_percent": NaN, "last_region": [1e999, 0, 10, 10]}')
+        settings = tool.Settings(self.path)
+        settings.load()
+        self.assertEqual(settings["jpeg_quality"], 90)
+        self.assertEqual(settings["selection_width"], 2)
+        self.assertEqual(settings["dim_percent"], 40)
+        self.assertIsNone(settings["last_region"])
+        with self.assertRaises(ValueError):
+            settings["jpeg_quality"] = "1e999"
 
 
 class FolderTests(unittest.TestCase):
@@ -220,6 +286,8 @@ class FolderTests(unittest.TestCase):
         second.write_text("x")
         third = tool.unique_path(folder, "a.png")
         self.assertEqual([p.name for p in (first, second, third)], ["a.png", "a_1.png", "a_2.png"])
+        # a name an open editor will save to counts as taken
+        self.assertEqual(tool.unique_path(folder, "b.png", taken={folder / "b.png"}).name, "b_1.png")
 
     def test_format_for_path(self):
         self.assertEqual(tool.format_for_path("x.JPEG"), "jpg")
@@ -253,6 +321,28 @@ class ScreenGrabTests(unittest.TestCase):
         self.assertEqual(grab.crop((90, 90, 50, 50)).size, (10, 10))
         with self.assertRaises(ValueError):
             grab.crop((500, 500, 10, 10))
+
+    def test_tiny_region_on_downscaled_grab_is_at_least_one_pixel(self):
+        grab = tool.ScreenGrab(self._numbered(75, 75), (0, 0), (100, 100))
+        self.assertEqual(grab.crop((2, 2, 1, 1)).size, (1, 1))
+
+
+class RectMinusTests(unittest.TestCase):
+    @staticmethod
+    def _area(rects):
+        return sum((r - l) * (b - t) for l, t, r, b in rects)
+
+    def test_parts_cover_exactly_the_difference(self):
+        cases = [((0, 0, 100, 80), (20, 10, 60, 50)), ((0, 0, 100, 80), (50, 40, 200, 200)),
+                 ((10, 10, 20, 20), (0, 0, 100, 100)), ((0, 0, 10, 10), (20, 20, 30, 30)),
+                 ((0, 0, 100, 80), (0, 0, 100, 40))]
+        for a, b in cases:
+            parts = tool.rect_minus(a, b)
+            pixels = {(x, y) for l, t, r, bottom in parts for x in range(l, r) for y in range(t, bottom)}
+            expected = {(x, y) for x in range(a[0], a[2]) for y in range(a[1], a[3])
+                        if not (b[0] <= x < b[2] and b[1] <= y < b[3])}
+            self.assertEqual(pixels, expected, (a, b))
+            self.assertEqual(self._area(parts), len(expected), "parts must not overlap")
 
 
 class AnnotationTests(unittest.TestCase):

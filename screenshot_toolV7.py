@@ -132,8 +132,8 @@ class ScreenGrab:
         sx, sy = self.scale
         left = max(0, round((x - self.origin[0]) * sx))
         top = max(0, round((y - self.origin[1]) * sy))
-        right = min(self.image.width, round((x - self.origin[0] + width) * sx))
-        bottom = min(self.image.height, round((y - self.origin[1] + height) * sy))
+        right = min(self.image.width, max(round((x - self.origin[0] + width) * sx), left + 1))
+        bottom = min(self.image.height, max(round((y - self.origin[1] + height) * sy), top + 1))
         if right <= left or bottom <= top:
             raise ValueError("the region is outside the visible screens")
         return self.image.crop((left, top, right, bottom))
@@ -147,6 +147,15 @@ def grab_screens(root):
         # differ if DPI awareness couldn't be enabled (then ScreenGrab scales).
         x, y, width, height = _windows_virtual_screen()
         return ScreenGrab(image.convert("RGB"), (x, y), (width, height))
+    display = os.environ.get("DISPLAY")
+    if display and not IS_MAC:
+        # X11: Tk caches the screen size and misses monitor/resolution changes;
+        # a direct X grab is always current and in the same units as Tk.
+        try:
+            image = ImageGrab.grab(xdisplay=display)
+            return ScreenGrab(image.convert("RGB"), (0, 0), image.size)
+        except OSError:
+            pass  # e.g. Wayland: fall back to the desktop's screenshot tool
     image = ImageGrab.grab()
     size = (root.winfo_screenwidth(), root.winfo_screenheight())
     return ScreenGrab(image.convert("RGB"), (0, 0), size)
@@ -326,6 +335,8 @@ def event_modifiers(state):
     if (IS_WINDOWS and state & 0x20000) or (IS_MAC and state & 0x10) or \
             (not IS_WINDOWS and not IS_MAC and state & 0x8):
         modifiers.add("Alt")
+    if IS_MAC and state & 0x8:  # Command
+        modifiers.add("Win")
     return modifiers
 
 
@@ -368,6 +379,8 @@ def display_hotkey(text):
     parts = text.split("+")
     if parts[-1] == "Print":
         parts[-1] = "Print Screen"
+    if IS_MAC:
+        parts = ["Cmd" if part == "Win" else part for part in parts]
     return " + ".join(parts)
 
 
@@ -376,14 +389,17 @@ def hotkey_label(text):
     return display_hotkey(text) if text else ""
 
 
+EDITING_KEYS = {"Space", "Insert", "Delete", "Home", "End", "PageUp", "PageDown"}
+
+
 def hotkey_problem(parsed):
     """Reason a shortcut would get in the way of normal typing, or None."""
     if not parsed:
         return None
     modifiers, key = parsed
-    typing_key = len(key) == 1 or key == "Space"
+    typing_key = len(key) == 1 or key in EDITING_KEYS
     if typing_key and not modifiers & {"Ctrl", "Alt", "Win"}:
-        return f"{format_hotkey(parsed)} would fire while typing; add Ctrl, Alt or Win"
+        return f"{display_hotkey(format_hotkey(parsed))} would stop working normally in every program; add Ctrl, Alt or Win"
     return None
 
 
@@ -644,8 +660,10 @@ def _as_int(low, high):
     def convert(value):
         if isinstance(value, bool):
             raise ValueError("expected a number")
-        number = int(float(str(value).strip()))
-        return min(high, max(low, number))
+        number = float(str(value).strip())
+        if not math.isfinite(number):
+            raise ValueError("expected a number")
+        return min(high, max(low, int(number)))
     return convert
 
 
@@ -775,7 +793,8 @@ class Settings:
     def __init__(self, path=None):
         self.values = default_settings()
         self._explicit = path is not None
-        self.path = Path(path) if path else app_directory() / SETTINGS_FILE
+        self.path = Path(path) if path else app_directory() / SETTINGS_FILE  # preferred file
+        self.saved_to = self.path  # where the last save actually went
         self.problem = None
 
     def __getitem__(self, key):
@@ -785,16 +804,37 @@ class Settings:
         _, convert = SETTINGS_SCHEMA[key]
         self.values[key] = convert(value)
 
-    def _candidates(self):
-        if self._explicit:
-            return [self.path]
-        # Older versions saved next to the current working directory.
-        return [self.path, user_config_directory() / SETTINGS_FILE, Path.cwd() / SETTINGS_FILE]
+    def _fallback(self):
+        return None if self._explicit else user_config_directory() / SETTINGS_FILE
+
+    @staticmethod
+    def _writable(path):
+        try:
+            with open(path, "a"):
+                pass
+            return True
+        except OSError:
+            return False
+
+    def _source(self):
+        fallback = self._fallback()
+        if self.path.is_file():
+            # A read-only copy keeps its changes in the user folder instead.
+            if fallback and fallback.is_file() and not self._writable(self.path):
+                return fallback
+            return self.path
+        if fallback and fallback.is_file():
+            return fallback  # a new copy starts from the last used settings
+        legacy = Path.cwd() / SETTINGS_FILE  # older versions saved here
+        if not self._explicit and legacy.is_file():
+            return legacy
+        return None
 
     def load(self):
-        source = next((p for p in self._candidates() if p.is_file()), None)
+        source = self._source()
         if source is None:
             return
+        self.saved_to = source
         try:
             with open(source, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
@@ -807,31 +847,33 @@ class Settings:
             except OSError:
                 pass
             return
-        if source.parent == user_config_directory():
-            self.path = source
         for key, value in data.items():
             if key in SETTINGS_SCHEMA:
                 try:
                     self[key] = value
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, ArithmeticError):
                     pass
 
     def save(self):
+        """Write next to the program, or to the user folder if that fails."""
         text = json.dumps(self.values, indent=4)
-        targets = [self.path]
-        if not self._explicit:
-            targets.append(user_config_directory() / SETTINGS_FILE)
+        targets = [self.path] + ([self._fallback()] if self._fallback() else [])
         error = None
         for target in targets:
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                temporary = target.with_name(target.name + ".tmp")
-                temporary.write_text(text, encoding="utf-8")
-                os.replace(temporary, target)
-                self.path = target
-                return
-            except OSError as exc:
-                error = exc
+            for _ in range(3):
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = target.with_name(target.name + ".tmp")
+                    temporary.write_text(text, encoding="utf-8")
+                    os.replace(temporary, target)
+                    self.saved_to = target
+                    return
+                except PermissionError as exc:  # often a brief antivirus/OneDrive lock
+                    error = exc
+                    time.sleep(0.05)
+                except OSError as exc:
+                    error = exc
+                    break
         raise error
 
 
@@ -892,11 +934,14 @@ def build_filename(pattern, extension, now=None):
     return f"{stem}.{extension}"
 
 
-def unique_path(folder, filename):
-    """folder/filename, adding _1, _2, ... so nothing gets overwritten."""
+def unique_path(folder, filename, taken=()):
+    """folder/filename, adding _1, _2, ... so nothing gets overwritten.
+
+    taken: paths that count as used even if no file exists yet.
+    """
     path = Path(folder) / filename
     counter = 1
-    while path.exists():
+    while path.exists() or path in taken:
         path = Path(folder) / f"{Path(filename).stem}_{counter}{Path(filename).suffix}"
         counter += 1
     return path
@@ -1198,7 +1243,11 @@ def center_window(window, width, height, parent=None):
     else:
         x = (window.winfo_screenwidth() - width) // 2
         y = (window.winfo_screenheight() - height) // 3
-    window.geometry(f"{width}x{height}+{max(0, x)}+{max(0, y)}")
+    # Keep it on screen, clear of a taskbar at the bottom.
+    vx, vy, vw, vh = virtual_screen_rect(window)
+    x = max(vx, min(x, vx + vw - width))
+    y = max(vy, min(y, vy + vh - height - UI.px(70)))
+    window.geometry(f"{width}x{height}+{x}+{y}")
 
 
 def watch(variable, widget, callback):
@@ -1318,53 +1367,89 @@ class HotkeyEntry(ttk.Entry):
 
     MODIFIER_KEYSYMS = {
         "Shift_L": "Shift", "Shift_R": "Shift", "Control_L": "Ctrl", "Control_R": "Ctrl",
-        "Alt_L": "Alt", "Alt_R": "Alt", "Meta_L": "Alt", "Meta_R": "Alt",
-        "Super_L": "Win", "Super_R": "Win", "Win_L": "Win", "Win_R": "Win",
+        "Alt_L": "Alt", "Alt_R": "Alt", "Super_L": "Win", "Super_R": "Win", "Win_L": "Win", "Win_R": "Win",
+        # macOS reports Command as Meta; on X11, Shift+Alt can produce Meta.
+        "Meta_L": "Win" if IS_MAC else "Alt", "Meta_R": "Win" if IS_MAC else "Alt",
     }
+    CHORD_TIMEOUT = 0.5  # seconds a just-released modifier still counts
 
     def __init__(self, master, variable, **kwargs):
         super().__init__(master, textvariable=variable, state="readonly", **kwargs)
         self.variable = variable
-        self.held = set()
+        self.held = set()  # modifiers that are down
+        self.chord = set()  # modifiers pressed since the last recorded key
+        self._released_at = 0.0
+        self._print_pressed = False
         self.bind("<KeyPress>", self._press)
         self.bind("<KeyRelease>", self._release)
-        self.bind("<FocusOut>", lambda e: self.held.clear())
+        self.bind("<FocusOut>", lambda e: self._reset())
+
+    def _reset(self):
+        self.held.clear()
+        self.chord.clear()
+        self._print_pressed = False
 
     def _modifiers(self, event):
-        return frozenset(self.held | event_modifiers(event.state))
+        # People often let go of Ctrl a moment before Print Screen.
+        if not self.held and time.monotonic() - self._released_at > self.CHORD_TIMEOUT:
+            self.chord.clear()
+        return frozenset(self.held | self.chord | event_modifiers(event.state))
+
+    def _record(self, event, key):
+        self.variable.set(hotkey_label(format_hotkey((self._modifiers(event), key))))
+        self.chord = set(self.held)
 
     def _press(self, event):
         modifier = self.MODIFIER_KEYSYMS.get(event.keysym)
         if modifier:
             self.held.add(modifier)
+            self.chord.add(modifier)
             return "break"
-        if event.keysym == "Tab":
-            return None
-        if event.keysym == "BackSpace" and not self.held:
+        if event.keysym in ("BackSpace", "Delete") and not (self.held or event_modifiers(event.state)):
             self.variable.set("")
             return "break"
         key = key_from_tk_keysym(event.keysym)
-        if key:
-            self.variable.set(hotkey_label(format_hotkey((self._modifiers(event), key))))
+        if key is None:
+            return None  # Tab, Shift+Tab, Escape, Return... keep their usual meaning
+        self._print_pressed = key == "Print"
+        self._record(event, key)
         return "break"
 
     def _release(self, event):
         modifier = self.MODIFIER_KEYSYMS.get(event.keysym)
         if modifier:
             self.held.discard(modifier)
-        elif event.keysym == "Print":  # Windows only reports Print Screen on release
-            self.variable.set(hotkey_label(format_hotkey((self._modifiers(event), "Print"))))
-        return "break"
+            self._released_at = time.monotonic()
+            return "break"
+        if key_from_tk_keysym(event.keysym) == "Print":
+            if self._print_pressed:  # already recorded when it was pressed
+                self._print_pressed = False
+            else:  # Windows only reports Print Screen on release
+                self._record(event, "Print")
+            return "break"
+        return None
 
 
 # ---------------------------------------------------------------------------
 # Region selection overlay
 # ---------------------------------------------------------------------------
 
+def rect_minus(a, b):
+    """Parts of rectangle a not covered by b; rectangles are (left, top, right, bottom)."""
+    a_left, a_top, a_right, a_bottom = a
+    b_left, b_top, b_right, b_bottom = b
+    if b_left >= a_right or b_right <= a_left or b_top >= a_bottom or b_bottom <= a_top:
+        return [a]
+    middle_top, middle_bottom = max(a_top, b_top), min(a_bottom, b_bottom)
+    parts = [(a_left, a_top, a_right, b_top), (a_left, b_bottom, a_right, a_bottom),
+             (a_left, middle_top, b_left, middle_bottom), (b_right, middle_top, a_right, middle_bottom)]
+    return [p for p in parts if p[2] > p[0] and p[3] > p[1]]
+
+
 class RegionSelector:
     """Greenshot-style region picker drawn over a frozen image of all screens."""
 
-    MAG_RADIUS = 10  # pixels shown either side of the cursor
+    MAG_RADIUS = 10  # real pixels shown either side of the cursor
     MAG_ZOOM = 8
     HINT = ("Drag to select an area   •   Enter: whole screen   •   "
             "Arrow keys: move 1 px (Shift: 10 px)   •   Esc / right-click: cancel")
@@ -1377,6 +1462,9 @@ class RegionSelector:
         self.finished = False
         self.start = None
         self._redraw_id = None
+        self._painted = None  # selection rectangle currently shown undimmed
+        self._right_click_cancels = False
+        self._hint_used = False
 
         width, height = grab.size
         self.width, self.height = width, height
@@ -1389,6 +1477,7 @@ class RegionSelector:
         try:
             self._build(origin_x, origin_y)
         except Exception:  # never leave a frozen full-screen window behind
+            self.finished = True
             self.win.destroy()
             raise
 
@@ -1400,30 +1489,37 @@ class RegionSelector:
         win.geometry(f"{width}x{height}+{origin_x}+{origin_y}")
         win.attributes("-topmost", True)
         win.configure(bg="black")
+        # Alt+F4 and other system closes must cancel, not leave the app hidden.
+        win.protocol("WM_DELETE_WINDOW", self.cancel)
+        win.bind("<Destroy>", self._on_destroy, add="+")
         canvas = self.canvas = tk.Canvas(win, width=width, height=height, bg="black",
                                          highlightthickness=0, borderwidth=0, cursor="crosshair")
         canvas.pack(fill=tk.BOTH, expand=True)
 
         self.bright = ImageTk.PhotoImage(image, master=win)
         dim = settings["dim_percent"] / 100
+        self.selection_photo = None
         if dim > 0:
             dark = Image.blend(image, Image.new("RGB", image.size, "black"), dim)
             self.background = ImageTk.PhotoImage(dark, master=win)
-            self.selection_photo = tk.PhotoImage(master=win)
+            # A transparent full-size layer; only the strips that change are
+            # copied in or erased while dragging, which keeps 4K screens smooth.
+            self.selection_photo = tk.PhotoImage(master=win, width=width, height=height)
+            self.eraser = tk.PhotoImage(master=win, width=1, height=1)
         else:
             self.background = self.bright
-            self.selection_photo = None
         canvas.create_image(0, 0, anchor="nw", image=self.background)
-        self.selection_item = canvas.create_image(0, 0, anchor="nw", state="hidden")
         if self.selection_photo is not None:
-            canvas.itemconfigure(self.selection_item, image=self.selection_photo)
+            canvas.create_image(0, 0, anchor="nw", image=self.selection_photo)
 
         line_state = "normal" if settings["show_crosshair"] else "hidden"
         cross, cross_width = settings["crosshair_color"], settings["crosshair_width"]
         self.h_line = canvas.create_line(0, 0, width, 0, fill=cross, width=cross_width, state=line_state)
         self.v_line = canvas.create_line(0, 0, 0, height, fill=cross, width=cross_width, state=line_state)
-        self.rect = canvas.create_rectangle(0, 0, 0, 0, outline=settings["selection_color"],
-                                            width=settings["selection_width"], state="hidden")
+        # Four filled bars instead of an outline: pixel-exact on every platform,
+        # always outside the selected pixels.
+        self.border = [canvas.create_rectangle(0, 0, 0, 0, fill=settings["selection_color"], outline="",
+                                               state="hidden") for _ in range(4)]
         self.size_bg = canvas.create_rectangle(0, 0, 0, 0, fill="#111827", outline="", state="hidden")
         self.size_text = canvas.create_text(0, 0, anchor="nw", fill="white",
                                             font=UI.font(10, "bold"), state="hidden")
@@ -1447,12 +1543,17 @@ class RegionSelector:
         self.hint_bg = canvas.create_rectangle(x0 - pad, y0 - pad / 2, x1 + pad, y1 + pad / 2,
                                                fill="#111827", outline="#374151")
         canvas.tag_lower(self.hint_bg, self.hint_text)
+        margin = UI.px(40)
+        self._hint_zone = (x0 - pad - margin, y0 - margin, x1 + pad + margin, y1 + margin)
 
+        # Tk 8.6 on macOS reports the right mouse button as button 2.
+        right = "2" if win.tk.call("tk", "windowingsystem") == "aqua" and tk.TkVersion < 8.7 else "3"
         canvas.bind("<Motion>", self._on_motion)
         canvas.bind("<B1-Motion>", self._on_motion)
         canvas.bind("<ButtonPress-1>", self._on_press)
         canvas.bind("<ButtonRelease-1>", self._on_release)
-        canvas.bind("<ButtonPress-3>", self._on_right_click)
+        canvas.bind(f"<ButtonPress-{right}>", self._on_right_press)
+        canvas.bind(f"<ButtonRelease-{right}>", self._on_right_release)
         win.bind("<Escape>", lambda e: self.cancel())
         for sequence in ("<Return>", "<KP_Enter>", "<space>"):
             win.bind(sequence, self._select_monitor)
@@ -1509,8 +1610,7 @@ class RegionSelector:
     def _on_press(self, event):
         self._on_motion(event)
         self.start = self.cursor
-        self.canvas.itemconfigure(self.hint_text, state="hidden")
-        self.canvas.itemconfigure(self.hint_bg, state="hidden")
+        self._hint_used = True
         self._redraw()
 
     def _on_release(self, event):
@@ -1524,11 +1624,16 @@ class RegionSelector:
             return
         self._finish(region)
 
-    def _on_right_click(self, event):
+    def _on_right_press(self, event):
+        # Cancel on release, so the release doesn't reach the program underneath
+        # (Windows would open its context menu).
+        self._right_click_cancels = self.start is None
         if self.start is not None:  # abandon the current drag, keep selecting
             self.start = None
             self._redraw()
-        else:
+
+    def _on_right_release(self, event):
+        if self._right_click_cancels:
             self.cancel()
 
     def _nudge(self, event, dx, dy):
@@ -1547,6 +1652,14 @@ class RegionSelector:
         right, bottom = min(self.width, mx + mw), min(self.height, my + mh)
         self._finish((left, top, right - left, bottom - top))
 
+    def _on_destroy(self, event):
+        if event.widget is self.win and not self.finished:  # closed by the system
+            self.finished = True
+            if self._redraw_id is not None:
+                self.win.after_cancel(self._redraw_id)
+                self._redraw_id = None
+            self.on_cancel()
+
     # -- drawing -----------------------------------------------------------
     def _schedule_redraw(self):
         if self._redraw_id is None and not self.finished:
@@ -1562,23 +1675,42 @@ class RegionSelector:
         canvas.coords(self.v_line, x, 0, x, self.height)
         if self.start is not None:
             left, top, width, height = self._current_region()
-            right, bottom = left + width, top + height
-            pad = math.ceil(self.settings["selection_width"] / 2)
-            canvas.coords(self.rect, left - pad, top - pad, right + pad - 1, bottom + pad - 1)
-            canvas.itemconfigure(self.rect, state="normal")
-            if self.selection_photo is not None:
-                photo = self.selection_photo
-                photo.blank()
-                photo.configure(width=width, height=height)
-                photo.tk.call(photo.name, "copy", str(self.bright),
-                              "-from", left, top, right, bottom, "-to", 0, 0)
-                canvas.coords(self.selection_item, left, top)
-                canvas.itemconfigure(self.selection_item, state="normal")
+            self._draw_border(left, top, left + width, top + height)
+            self._paint_selection((left, top, left + width, top + height))
             self._draw_size_label(f"{width} × {height}", left, top)
         else:
-            for item in (self.rect, self.selection_item, self.size_bg, self.size_text):
+            for item in self.border + [self.size_bg, self.size_text]:
                 canvas.itemconfigure(item, state="hidden")
+            self._paint_selection(None)
+        zone = self._hint_zone
+        near = zone[0] <= x <= zone[2] and zone[1] <= y <= zone[3]
+        hint_state = "hidden" if self._hint_used or near else "normal"
+        canvas.itemconfigure(self.hint_text, state=hint_state)
+        canvas.itemconfigure(self.hint_bg, state=hint_state)
         self._draw_info(x, y)
+
+    def _draw_border(self, left, top, right, bottom):
+        w = self.settings["selection_width"]
+        bars = ((left - w, top - w, right + w, top), (left - w, bottom, right + w, bottom + w),
+                (left - w, top, left, bottom), (right, top, right + w, bottom))
+        for item, bar in zip(self.border, bars):
+            self.canvas.coords(item, *bar)
+            self.canvas.itemconfigure(item, state="normal")
+
+    def _paint_selection(self, rect):
+        """Show rect undimmed, updating only the parts that changed."""
+        photo = self.selection_photo
+        if photo is None or rect == self._painted:
+            return
+        old, self._painted = self._painted, rect
+        if old is not None:
+            for left, top, right, bottom in (rect_minus(old, rect) if rect else [old]):
+                photo.tk.call(photo.name, "copy", self.eraser.name, "-to", left, top, right, bottom,
+                              "-compositingrule", "set")
+        if rect is not None:
+            for left, top, right, bottom in (rect_minus(rect, old) if old else [rect]):
+                photo.tk.call(photo.name, "copy", str(self.bright), "-from", left, top, right, bottom,
+                              "-to", left, top)
 
     def _draw_size_label(self, text, left, top):
         canvas = self.canvas
@@ -1588,8 +1720,10 @@ class RegionSelector:
         label_w, label_h = x1 - x0, y1 - y0
         pad = UI.px(4)
         gap = self.settings["selection_width"] + pad
-        tx = left
-        ty = top - label_h - gap - pad if top - label_h - gap - pad >= 0 else top + gap + pad
+        mx, my, mw, _ = self._monitor_at(left, top)  # keep the label on a visible monitor
+        tx = max(mx, min(left, mx + mw - label_w - 2 * pad))
+        above = top - label_h - gap - pad
+        ty = above if above >= my else top + gap + pad
         canvas.coords(self.size_text, tx + pad, ty)
         canvas.coords(self.size_bg, tx, ty - pad / 2, tx + label_w + 2 * pad, ty + label_h + pad / 2)
         canvas.itemconfigure(self.size_bg, state="normal")
@@ -1599,7 +1733,10 @@ class RegionSelector:
     def _draw_info(self, x, y):
         canvas = self.canvas
         screen_x, screen_y = x + self.grab.origin[0], y + self.grab.origin[1]
-        red, green, blue = self.image.getpixel((x, y))[:3]
+        # Read real pixels (the overlay copy is resampled on Retina screens).
+        real, (sx, sy) = self.grab.image, self.grab.scale
+        real_x, real_y = min(int(x * sx), real.width - 1), min(int(y * sy), real.height - 1)
+        red, green, blue = real.getpixel((real_x, real_y))[:3]
         lines = [f"X {screen_x}    Y {screen_y}"]
         if self.start is not None:
             _, _, width, height = self._current_region()
@@ -1621,18 +1758,19 @@ class RegionSelector:
 
         if self.mag_photo is not None:
             radius, zoom = self.MAG_RADIUS, self.MAG_ZOOM
-            zoomed = self.image.crop((x - radius, y - radius, x + radius + 1, y + radius + 1))
+            zoomed = real.crop((real_x - radius, real_y - radius, real_x + radius + 1, real_y + radius + 1))
             zoomed = zoomed.resize((self.mag_size, self.mag_size), NEAREST)
             draw = ImageDraw.Draw(zoomed)
             centre = radius * zoom
-            middle = centre + zoom // 2
+            cell_w, cell_h = zoom * max(1, round(sx)), zoom * max(1, round(sy))  # one screen point
+            mid_x, mid_y = centre + zoom // 2, centre + zoom // 2
             cross = self.settings["crosshair_color"]
-            draw.line([(0, middle), (centre - 1, middle)], fill=cross)
-            draw.line([(centre + zoom, middle), (self.mag_size, middle)], fill=cross)
-            draw.line([(middle, 0), (middle, centre - 1)], fill=cross)
-            draw.line([(middle, centre + zoom), (middle, self.mag_size)], fill=cross)
-            draw.rectangle([centre - 1, centre - 1, centre + zoom, centre + zoom], outline="#000000")
-            draw.rectangle([centre, centre, centre + zoom - 1, centre + zoom - 1], outline="#FFFFFF")
+            draw.line([(0, mid_y), (centre - 1, mid_y)], fill=cross)
+            draw.line([(centre + cell_w, mid_y), (self.mag_size, mid_y)], fill=cross)
+            draw.line([(mid_x, 0), (mid_x, centre - 1)], fill=cross)
+            draw.line([(mid_x, centre + cell_h), (mid_x, self.mag_size)], fill=cross)
+            draw.rectangle([centre - 1, centre - 1, centre + cell_w, centre + cell_h], outline="#000000")
+            draw.rectangle([centre, centre, centre + cell_w - 1, centre + cell_h - 1], outline="#FFFFFF")
             self.mag_photo.paste(zoomed)
             canvas.coords(self.mag_item, px, py)
             canvas.coords(self.mag_border, px - 1, py - 1, px + mag, py + mag)
@@ -1652,8 +1790,11 @@ class RegionSelector:
         screen_region = (x + self.grab.origin[0], y + self.grab.origin[1], width, height)
         try:
             image = self.grab.crop(screen_region)
-        finally:
+        except Exception:
             self._close()
+            self.on_cancel()
+            raise
+        self._close()
         self.on_done(image, screen_region)
 
     def cancel(self):
@@ -1696,8 +1837,9 @@ class ImageEditor:
     PRESET_COLORS = ("#FF0000", "#FF8C00", "#FFD400", "#22C55E", "#2563EB", "#000000", "#FFFFFF")
     PAD = 16
 
-    def __init__(self, app, image, path=None):
+    def __init__(self, app, image, path=None, capture_id=None):
         self.app = app
+        self.capture_id = capture_id
         self.base = image.convert("RGB")
         self.path = Path(path) if path else None
         self.shapes = []
@@ -1706,16 +1848,16 @@ class ImageEditor:
         self.rendered = self.base.copy()
         self.drag = None
         self.text_entry = None
-        self.scale = 1.0
+        self.scale_x = self.scale_y = 1.0
         self.offset = (0, 0)
         self.photo = None
         self._resize_id = None
+        self._last_size = app.settings["editor_size"]
         self._shortcuts = {key: tool for tool, _, key, _ in self.TOOLS}
         self._hints = {tool: hint for tool, _, _, hint in self.TOOLS}
 
         win = self.win = tk.Toplevel(app.root)
         win.configure(bg=BG)
-        win.minsize(UI.px(620), UI.px(420))
         self.tool = tk.StringVar(value="rect")
         self.color = tk.StringVar(value=app.settings["editor_color"])
         self.size = tk.StringVar(value=str(app.settings["editor_size"]))
@@ -1725,16 +1867,16 @@ class ImageEditor:
         self._fit_window()
         self._update_title()
         watch(self.tool, win, self._update_status)
-        watch(self.color, win, self._remember_style)
-        watch(self.size, win, self._remember_style)
+        watch(self.color, win, self._style_changed)
+        watch(self.size, win, self._style_changed)
 
         win.bind("<KeyPress>", self._on_key)
-        for sequence, handler in (
-            ("<Control-z>", self.undo), ("<Control-y>", self.redo), ("<Control-Z>", self.redo),
-            ("<Control-s>", self.save), ("<Control-S>", self.save_as),
-            ("<Control-c>", self.copy), ("<Control-w>", self.close), ("<Escape>", self._on_escape),
-        ):
-            win.bind(sequence, handler)
+        # One handler for Ctrl+letter, so Caps Lock (upper-case keysyms) can't
+        # turn Ctrl+Z into redo or Ctrl+S into Save As.
+        win.bind("<Control-KeyPress>", self._on_shortcut)
+        if IS_MAC:
+            win.bind("<Command-KeyPress>", self._on_shortcut)
+        win.bind("<Escape>", self._on_escape)
         win.protocol("WM_DELETE_WINDOW", self.close)
         win.after(30, self._refresh)
         win.lift()
@@ -1753,7 +1895,7 @@ class ImageEditor:
         self.undo_button.pack(side=tk.LEFT)
         self.redo_button = ttk.Button(top, text="Redo", command=self.redo)
         self.redo_button.pack(side=tk.LEFT, padx=(px(6), 0))
-        ttk.Button(top, text="Close", command=self.close).pack(side=tk.RIGHT)
+        ttk.Button(top, text="Close", command=self.close).pack(side=tk.RIGHT, padx=(px(10), 0))
 
         status = tk.Frame(win, bg=STATUS_COLORS["info"][0])
         status.pack(fill=tk.X, side=tk.BOTTOM)
@@ -1780,10 +1922,15 @@ class ImageEditor:
             swatch.grid(row=index // 4, column=1 + index % 4, padx=1, pady=1)
             swatch.bind("<Button-1>", lambda e, c=preset: self.color.set(c))
         ttk.Label(inner, text="Size", style="CardTitle.TLabel").pack(anchor="w", padx=px(4), pady=(px(10), 0))
-        ttk.Spinbox(inner, from_=1, to=20, textvariable=self.size, width=6).pack(
-            anchor="w", padx=px(4), pady=(px(4), 0))
+        self.size_box = ttk.Spinbox(inner, from_=1, to=20, textvariable=self.size, width=6)
+        self.size_box.pack(anchor="w", padx=px(4), pady=(px(4), 0))
+        # After the arrows or Enter, give the keyboard back to the drawing area
+        # so tool letters and shortcuts don't end up in the size box.
+        for sequence in ("<<Increment>>", "<<Decrement>>"):
+            self.size_box.bind(sequence, lambda e: self.win.after_idle(self._spin_done), add="+")
+        self.size_box.bind("<Return>", lambda e: self._spin_done())
 
-        self.canvas = tk.Canvas(win, bg="#DADDE3", highlightthickness=0)
+        self.canvas = tk.Canvas(win, bg="#DADDE3", highlightthickness=0, width=px(200), height=px(150))
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=px(10), pady=(0, px(10)))
         self.shadow_item = self.canvas.create_rectangle(0, 0, 0, 0, fill="#B8BDC6", outline="")
         self.image_item = self.canvas.create_image(0, 0, anchor="nw")
@@ -1794,48 +1941,62 @@ class ImageEditor:
         self.canvas.configure(cursor="crosshair")
 
     def _fit_window(self):
+        win, pad = self.win, UI.px(self.PAD)
+        win.update_idletasks()
+        req_w, req_h = win.winfo_reqwidth(), win.winfo_reqheight()
+        chrome_w = req_w - self.canvas.winfo_reqwidth() + 2 * pad
+        chrome_h = req_h - self.canvas.winfo_reqheight() + 2 * pad
+        max_w, max_h = int(win.winfo_screenwidth() * 0.9), int(win.winfo_screenheight() * 0.88)
         width, height = self.base.size
-        screen_w, screen_h = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
-        chrome_w, chrome_h = UI.px(200), UI.px(120)
-        win_w = min(max(width + chrome_w, UI.px(720)), int(screen_w * 0.9))
-        win_h = min(max(height + chrome_h, UI.px(520)), int(screen_h * 0.88))
-        center_window(self.win, win_w, win_h)
+        win_w = min(max(width + chrome_w, UI.px(720), req_w), max_w)
+        win_h = min(max(height + chrome_h, UI.px(520), req_h), max_h)
+        win.minsize(min(req_w, max_w), min(req_h, max_h))
+        center_window(win, win_w, win_h)
 
     # -- coordinates -------------------------------------------------------
-    def _to_image(self, x, y):
-        width, height = self.rendered.size
-        ix = (x - self.offset[0]) / self.scale
-        iy = (y - self.offset[1]) / self.scale
-        return min(max(ix, 0), width), min(max(iy, 0), height)
+    def _to_image(self, x, y, clamp=True):
+        ix = (x - self.offset[0]) / self.scale_x
+        iy = (y - self.offset[1]) / self.scale_y
+        if clamp:
+            width, height = self.rendered.size
+            ix, iy = min(max(ix, 0), width), min(max(iy, 0), height)
+        return ix, iy
 
     def _to_canvas(self, x, y):
-        return x * self.scale + self.offset[0], y * self.scale + self.offset[1]
+        return x * self.scale_x + self.offset[0], y * self.scale_y + self.offset[1]
 
     def _size(self):
+        """The size box value; keeps the last valid size while it holds junk."""
         try:
-            return min(20, max(1, int(float(self.size.get()))))
+            self._last_size = min(20, max(1, int(float(self.size.get()))))
         except (ValueError, tk.TclError):
-            return 3
+            pass
+        return self._last_size
 
     # -- drawing -----------------------------------------------------------
     def _on_press(self, event):
         self.canvas.focus_set()
         self._commit_text()
         tool = self.tool.get()
+        if tool in ("text", "counter"):
+            x, y = self._to_image(event.x, event.y, clamp=False)
+            width, height = self.rendered.size
+            if not (0 <= x < width and 0 <= y < height):
+                return  # a click in the grey margin would add nothing visible
+            if tool == "text":
+                self._start_text((x, y))
+            else:
+                number = 1 + sum(1 for shape in self.shapes if shape.tool == "counter")
+                self._add(Shape("counter", [(x, y)], self.color.get(), self._size(), number=number))
+            return
         point = self._to_image(event.x, event.y)
-        if tool == "text":
-            self._start_text(point)
-            return
-        if tool == "counter":
-            number = 1 + sum(1 for shape in self.shapes if shape.tool == "counter")
-            self._add(Shape("counter", [point], self.color.get(), self._size(), number=number))
-            return
-        self.drag = {"tool": tool, "points": [point, point], "item": self._preview_item(tool)}
+        width = max(1, round(self._size() * self.scale_x))
+        self.drag = {"tool": tool, "points": [point, point], "width": width,
+                     "item": self._preview_item(tool, width)}
         self._update_preview_item()
 
-    def _preview_item(self, tool):
+    def _preview_item(self, tool, width):
         canvas, color = self.canvas, self.color.get()
-        width = max(1, round(self._size() * self.scale))
         if tool == "rect":
             return canvas.create_rectangle(0, 0, 0, 0, outline=color, width=width)
         if tool == "ellipse":
@@ -1845,16 +2006,24 @@ class ImageEditor:
             return canvas.create_rectangle(0, 0, 0, 0, outline=outline, width=2, dash=(5, 3))
         options = dict(fill=color, width=width, capstyle=tk.ROUND, joinstyle=tk.ROUND)
         if tool == "arrow":
-            length, half = (max(4, v * self.scale) for v in arrow_head(self._size()))
-            options.update(arrow=tk.LAST, arrowshape=(length, length, half))
+            length, half = (v * self.scale_x for v in arrow_head(self._size()))
+            # Tk measures the head's width from the edge of the line.
+            options.update(arrow=tk.LAST, arrowshape=(max(4, length), max(4, length), max(1, half - width / 2)))
         return canvas.create_line(0, 0, 0, 0, **options)
 
     def _update_preview_item(self):
-        points = self.drag["points"]
-        coords = [value for point in points for value in self._to_canvas(*point)]
-        if len(points) == 1:
+        drag = self.drag
+        coords = [value for point in drag["points"] for value in self._to_canvas(*point)]
+        if drag["tool"] in ("rect", "ellipse"):
+            # Tk centres outlines on the box; the final shape is drawn inside it.
+            x0, y0, x1, y1 = coords[0], coords[1], coords[-2], coords[-1]
+            left, right = sorted((x0, x1))
+            top, bottom = sorted((y0, y1))
+            inset = drag["width"] / 2
+            coords = [left + inset, top + inset, max(left + inset, right - inset), max(top + inset, bottom - inset)]
+        elif len(coords) == 2:
             coords *= 2
-        self.canvas.coords(self.drag["item"], *coords)
+        self.canvas.coords(drag["item"], *coords)
 
     def _on_drag(self, event):
         if not self.drag:
@@ -1863,7 +2032,7 @@ class ImageEditor:
         tool, points = self.drag["tool"], self.drag["points"]
         if tool == "freehand":
             last = points[-1]
-            if abs(point[0] - last[0]) * self.scale >= 1 or abs(point[1] - last[1]) * self.scale >= 1:
+            if abs(point[0] - last[0]) * self.scale_x >= 1 or abs(point[1] - last[1]) * self.scale_y >= 1:
                 points.append(point)
         else:
             if event.state & 0x1:
@@ -1897,11 +2066,15 @@ class ImageEditor:
                 return
         self._add(Shape(tool, list(points), self.color.get(), self._size()))
 
-    def _start_text(self, point):
+    def _text_style(self):
         color = self.color.get()
-        font_px = max(8, round(text_font_px(self._size()) * self.scale))
-        entry = tk.Entry(self.canvas, font=(UI.family, -font_px), fg=color, bg="#FFFFFF",
-                         insertbackground=color, relief="solid", borderwidth=1, width=24)
+        font_px = max(8, round(text_font_px(self._size()) * self.scale_y))
+        # A dark field for light colours, so white or yellow text stays readable.
+        background = "#1F2937" if _contrast_color(color) == "#000000" else "#FFFFFF"
+        return dict(font=(UI.family, -font_px), fg=color, insertbackground=color, bg=background)
+
+    def _start_text(self, point):
+        entry = tk.Entry(self.canvas, relief="solid", borderwidth=1, width=24, **self._text_style())
         x, y = self._to_canvas(*point)
         window = self.canvas.create_window(x, y, window=entry, anchor="nw")
         self.text_entry = (entry, window, point)
@@ -1936,25 +2109,20 @@ class ImageEditor:
         self.rendered = render_shape(self.rendered, shape)
         self._changed()
 
-    def undo(self, event=None):
-        if self._typing(event):
-            return None
+    def undo(self):
         self._commit_text()
         if self.shapes:
             self.undone.append(self.shapes.pop())
             self.rendered = render_shapes(self.base, self.shapes)
             self._changed()
-        return "break"
 
-    def redo(self, event=None):
-        if self._typing(event):
-            return None
+    def redo(self):
+        self._commit_text()
         if self.undone:
             shape = self.undone.pop()
             self.shapes.append(shape)
             self.rendered = render_shape(self.rendered, shape)
             self._changed()
-        return "break"
 
     def _changed(self):
         self._update_title()
@@ -1973,8 +2141,6 @@ class ImageEditor:
         self._resize_id = None
         if not self.win.winfo_exists():
             return
-        if self.text_entry:
-            self._commit_text()
         canvas_w = max(self.canvas.winfo_width(), 50)
         canvas_h = max(self.canvas.winfo_height(), 50)
         width, height = self.rendered.size
@@ -1986,7 +2152,7 @@ class ImageEditor:
             shown = self.rendered
         else:
             shown = self.rendered.resize((shown_w, shown_h), LANCZOS, reducing_gap=3.0)
-        self.scale = shown_w / width
+        self.scale_x, self.scale_y = shown_w / width, shown_h / height
         self.photo = ImageTk.PhotoImage(shown, master=self.win)
         x = max(pad, (canvas_w - shown_w) // 2)
         y = max(pad, (canvas_h - shown_h) // 2)
@@ -1994,13 +2160,17 @@ class ImageEditor:
         self.canvas.itemconfigure(self.image_item, image=self.photo)
         self.canvas.coords(self.image_item, x, y)
         self.canvas.coords(self.shadow_item, x + 3, y + 3, x + shown_w + 3, y + shown_h + 3)
+        if self.text_entry:  # keep typing: just move the field with the image
+            entry, window, point = self.text_entry
+            self.canvas.coords(window, *self._to_canvas(*point))
+            entry.configure(**self._text_style())
         self.undo_button.state(["!disabled"] if self.shapes else ["disabled"])
         self.redo_button.state(["!disabled"] if self.undone else ["disabled"])
         self._update_status()
 
     def _update_status(self, note=None):
         width, height = self.rendered.size
-        parts = [f"{width} × {height} px", f"{round(self.scale * 100)}%",
+        parts = [f"{width} × {height} px", f"{round(self.scale_x * 100)}%",
                  note or self._hints.get(self.tool.get(), "")]
         self.message.set("     ".join(p for p in parts if p))
 
@@ -2008,24 +2178,40 @@ class ImageEditor:
         name = self.path.name if self.path else "Unsaved capture"
         self.win.title(f"{'*' if self.is_dirty() else ''}{name} - {APP_NAME} editor")
 
-    def _remember_style(self):
+    def _style_changed(self):
+        self.app.settings["editor_size"] = self._size()
         try:
             self.app.settings["editor_color"] = self.color.get()
-            self.app.settings["editor_size"] = self._size()
         except ValueError:
             pass
+        if self.text_entry:  # what you see while typing is what gets drawn
+            self.text_entry[0].configure(**self._text_style())
+
+    def _spin_done(self):
+        if self.win.winfo_exists() and self.win.focus_get() is self.size_box:
+            self.canvas.focus_set()
 
     # -- keyboard ----------------------------------------------------------
-    @staticmethod
-    def _typing(event):
-        return event is not None and isinstance(event.widget, (tk.Entry, ttk.Entry, tk.Spinbox))
-
     def _on_key(self, event):
-        if self._typing(event) or event.state & 0x4:
+        if isinstance(event.widget, (tk.Entry, ttk.Entry, tk.Spinbox)) or event.state & 0x4:
+            return
+        if IS_MAC and event.state & 0x8:  # Command
             return
         tool = self._shortcuts.get(event.keysym.lower())
         if tool:
             self.tool.set(tool)
+
+    def _on_shortcut(self, event):
+        if isinstance(event.widget, tk.Entry):  # the text field keeps its own shortcuts
+            return None
+        actions = {("z", False): self.undo, ("z", True): self.redo, ("y", False): self.redo,
+                   ("s", False): self.save, ("s", True): self.save_as,
+                   ("c", False): self.copy, ("w", False): self.close}
+        action = actions.get((event.keysym.lower(), bool(event.state & 0x1)))
+        if action is None:
+            return None
+        action()
+        return "break"
 
     def _on_escape(self, event=None):
         if self.drag:
@@ -2033,21 +2219,18 @@ class ImageEditor:
             self.drag = None
 
     # -- file actions ------------------------------------------------------
-    def copy(self, event=None):
-        if self._typing(event):
-            return None
+    def copy(self):
         self._commit_text()
         error = self.app.copy_image(self.rendered)
         self._update_status("Copied to the clipboard" if error is None else f"Copy failed: {error}")
-        return "break"
 
-    def save(self, event=None):
+    def save(self):
         self._commit_text()
         if self.path is None:
             return self.save_as()
         return self._write(self.path)
 
-    def save_as(self, event=None):
+    def save_as(self):
         self._commit_text()
         folder = self.path.parent if self.path else self.app.output_folder()
         name = self.path.name if self.path else build_filename(
@@ -2071,10 +2254,10 @@ class ImageEditor:
         self.saved_shapes = list(self.shapes)
         self._update_title()
         self._update_status(f"Saved {path.name}")
-        self.app.editor_saved(self.rendered.copy(), path)
+        self.app.editor_saved(self, self.rendered.copy(), path)
         return True
 
-    def close(self, event=None):
+    def close(self):
         self._commit_text()
         if self.is_dirty():
             answer = messagebox.askyesnocancel(
@@ -2147,7 +2330,7 @@ class SettingsDialog:
             self.win.after(100, self._grab)
 
     def _tab(self, notebook, title):
-        frame = ttk.Frame(notebook, padding=UI.px(16))
+        frame = ttk.Frame(notebook, padding=(UI.px(14), UI.px(12)))
         notebook.add(frame, text=title)
         frame.columnconfigure(1, weight=1)
         return frame
@@ -2185,7 +2368,7 @@ class SettingsDialog:
         ttk.Label(delay, text="seconds (time to open menus before the screen is frozen)",
                   style="Muted.TLabel").pack(side=tk.LEFT, padx=(px(6), 0))
 
-        ttk.Label(tab, text=f"Settings file: {self.app.settings.path}", style="Muted.TLabel",
+        ttk.Label(tab, text=f"Settings file: {self.app.settings.saved_to}", style="Muted.TLabel",
                   wraplength=px(460), justify=tk.LEFT).grid(row=8, column=0, columnspan=3, sticky="w", pady=(px(16), 0))
 
         def update_example():
@@ -2344,14 +2527,15 @@ class SettingsDialog:
         try:
             for key in ("master_folder", "file_pattern", "image_format", "selection_color",
                         "crosshair_color", "copy_to_clipboard", "open_editor", "show_after_capture",
-                        "show_crosshair", "show_magnifier", "hotkeys_enabled", "dim_percent"):
+                        "show_crosshair", "show_magnifier", "hotkeys_enabled"):
                 values[key] = SETTINGS_SCHEMA[key][1](self.vars[key].get())
+            values["dim_percent"] = round(self.vars["dim_percent"].get())  # as shown next to the slider
             for key, label in (("jpeg_quality", "JPEG quality"), ("capture_delay", "Capture delay"),
                                ("selection_width", "Selection width"), ("crosshair_width", "Crosshair width")):
                 try:
                     values[key] = SETTINGS_SCHEMA[key][1](self.vars[key].get())
-                except (TypeError, ValueError):
-                    raise ValueError(f"{label} must be a number")
+                except (TypeError, ValueError, ArithmeticError):
+                    raise ValueError(f"{label} must be a number") from None
             seen = {}
             for _, key, label in HOTKEY_SETTINGS:
                 parsed = parse_hotkey(self.vars[key].get())
@@ -2366,11 +2550,13 @@ class SettingsDialog:
         except ValueError as error:
             self.error.set(str(error)[:1].upper() + str(error)[1:])
             return
+        previous = dict(settings.values)
         for key, value in values.items():
             settings[key] = value
         try:
             settings.save()
         except OSError as error:
+            settings.values = previous  # nothing changes unless it could be saved
             messagebox.showerror("Couldn't save settings", str(error), parent=self.win)
             return
         self._close()
@@ -2400,14 +2586,14 @@ class ScreenshotApp:
         self.settings.load()
         self.last_image = None
         self.last_path = None
+        self.capture_id = 0
         self.busy = False
         self.selector = None
         self.settings_dialog = None
         self.editors = []
         self.hotkey_problems = []
         self._local_bindings = []
-        self._prev_state = "normal"
-        self._hidden_by_alpha = False
+        self._hidden = []  # (window, how it was hidden, previous state) during a capture
         self._preview_id = None
         self.preview_photo = None
 
@@ -2427,6 +2613,9 @@ class ScreenshotApp:
         self._restore_geometry()
         self.apply_hotkeys()
         root.protocol("WM_DELETE_WINDOW", self.quit)
+        if IS_MAC:  # Cmd+Q and the app menu would otherwise exit without saving
+            root.createcommand("tk::mac::Quit", self.quit)
+            root.createcommand("tk::mac::ShowPreferences", self.open_settings)
         root.bind("<Control-e>", lambda e: self.open_editor())
 
         if self.settings.problem:
@@ -2439,22 +2628,19 @@ class ScreenshotApp:
     def _build_ui(self):
         root, px = self.root, UI.px
         root.configure(bg=BG)
-        root.minsize(px(440), px(560))
 
         self.status = tk.Label(root, anchor="w", justify=tk.LEFT, padx=px(12), pady=px(6), font=UI.font(9))
         self.status.pack(side=tk.BOTTOM, fill=tk.X)
         self.status.bind("<Configure>", lambda e: self.status.configure(wraplength=max(100, e.width - px(24))))
         self.set_status("Ready", "info")
 
-        outer = ttk.Frame(root, padding=(px(16), px(12), px(16), px(12)))
+        outer = ttk.Frame(root, padding=(px(14), px(10), px(14), px(10)))
         outer.pack(fill=tk.BOTH, expand=True)
 
         header = ttk.Frame(outer)
-        header.pack(fill=tk.X)
+        header.pack(fill=tk.X, pady=(0, px(8)))
         ttk.Label(header, text=APP_NAME, style="Header.TLabel").pack(side=tk.LEFT)
         ttk.Button(header, text="Settings", command=self.open_settings).pack(side=tk.RIGHT)
-        ttk.Label(outer, text="Capture, save and annotate screenshots", style="Muted.TLabel").pack(
-            anchor="w", pady=(0, px(10)))
 
         tiles = ttk.Frame(outer)
         tiles.pack(fill=tk.X)
@@ -2476,10 +2662,10 @@ class ScreenshotApp:
         ttk.Button(row, text="Browse…", command=self.browse_folder).pack(side=tk.LEFT, padx=(px(6), 0))
         ttk.Button(row, text="Open", command=self.open_output_folder).pack(side=tk.LEFT, padx=(px(6), 0))
         self.path_label = ttk.Label(card, style="CardMuted.TLabel", anchor="w", justify=tk.LEFT)
-        self.path_label.pack(fill=tk.X, pady=(px(4), 0))
+        self.path_label.pack(fill=tk.X, pady=(px(3), 0))
         self.path_label.bind("<Configure>", lambda e: self.path_label.configure(wraplength=max(100, e.width)))
         options = ttk.Frame(card, style="Card.TFrame")
-        options.pack(fill=tk.X, pady=(px(6), 0))
+        options.pack(fill=tk.X, pady=(px(4), 0))
         self.copy_var = tk.BooleanVar(value=self.settings["copy_to_clipboard"])
         self.editor_var = tk.BooleanVar(value=self.settings["open_editor"])
         ttk.Checkbutton(options, text="Copy to clipboard", variable=self.copy_var, style="Card.TCheckbutton",
@@ -2489,7 +2675,7 @@ class ScreenshotApp:
         self.folder_var.trace_add("write", lambda *_: self._folder_changed())
         self._folder_changed()
 
-        card = self._card(outer, "Region")
+        card = self._card(outer, "Region", note="used by Last region")
         row = ttk.Frame(card, style="Card.TFrame")
         row.pack(fill=tk.X)
         self.region_vars = []
@@ -2499,21 +2685,22 @@ class ScreenshotApp:
             entry = ttk.Entry(row, textvariable=variable, width=6)
             entry.pack(side=tk.LEFT)
             entry.bind("<Return>", lambda e: self.apply_region())
+            entry.bind("<KP_Enter>", lambda e: self.apply_region())
             self.region_vars.append(variable)
         ttk.Button(row, text="Apply", command=self.apply_region).pack(side=tk.RIGHT)
-        ttk.Label(card, style="CardMuted.TLabel",
-                  text="Screen pixels. “Last region” captures this area again.").pack(anchor="w", pady=(px(4), 0))
         self._show_region(self.settings["last_region"])
 
         card = self._card(outer, "Last capture", expand=True)
-        self.preview = tk.Canvas(card, bg="#EEF0F3", highlightthickness=0, height=px(160))
+        # The buttons are packed first (at the bottom) so they stay visible
+        # when the window is short; the preview takes whatever is left.
+        actions = ttk.Frame(card, style="Card.TFrame")
+        actions.pack(side=tk.BOTTOM, fill=tk.X, pady=(px(6), 0))
+        self.preview_info = ttk.Label(card, style="CardMuted.TLabel", text="", anchor="w")
+        self.preview_info.pack(side=tk.BOTTOM, fill=tk.X, pady=(px(4), 0))
+        self.preview = tk.Canvas(card, bg="#EEF0F3", highlightthickness=0, height=px(60))
         self.preview.pack(fill=tk.BOTH, expand=True)
         self.preview.bind("<Configure>", self._schedule_preview)
         self.preview.bind("<Double-Button-1>", lambda e: self.open_editor())
-        self.preview_info = ttk.Label(card, style="CardMuted.TLabel", text="", anchor="w")
-        self.preview_info.pack(fill=tk.X, pady=(px(6), 0))
-        actions = ttk.Frame(card, style="Card.TFrame")
-        actions.pack(fill=tk.X, pady=(px(6), 0))
         self.action_buttons = {}
         for name, text, command in (("folder", "Show in folder", self.show_in_folder),
                                     ("open", "Open", self.open_last_file),
@@ -2525,27 +2712,38 @@ class ScreenshotApp:
             self.action_buttons[name] = button
         self._update_action_buttons()
 
-    def _card(self, parent, title, expand=False):
+        root.update_idletasks()
+        self._content_height = root.winfo_reqheight()
+        root.minsize(min(px(440), root.winfo_screenwidth() - 40),
+                     min(self._content_height, root.winfo_screenheight() - 80))
+
+    def _card(self, parent, title, expand=False, note=None):
         frame = tk.Frame(parent, bg=CARD, highlightthickness=1, highlightbackground=BORDER,
                          highlightcolor=BORDER, borderwidth=0)
-        frame.pack(fill=tk.BOTH if expand else tk.X, expand=expand, pady=(UI.px(10), 0))
-        inner = ttk.Frame(frame, style="Card.TFrame", padding=(UI.px(12), UI.px(10)))
+        frame.pack(fill=tk.BOTH if expand else tk.X, expand=expand, pady=(UI.px(8), 0))
+        inner = ttk.Frame(frame, style="Card.TFrame", padding=(UI.px(12), UI.px(8)))
         inner.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(inner, text=title, style="CardTitle.TLabel").pack(anchor="w", pady=(0, UI.px(6)))
+        heading = ttk.Frame(inner, style="Card.TFrame")
+        heading.pack(fill=tk.X, pady=(0, UI.px(4)))
+        ttk.Label(heading, text=title, style="CardTitle.TLabel").pack(side=tk.LEFT)
+        if note:
+            ttk.Label(heading, text=note, style="CardMuted.TLabel").pack(side=tk.LEFT, padx=(UI.px(8), 0))
         return inner
 
     def _restore_geometry(self):
         root, px = self.root, UI.px
         vx, vy, vw, vh = virtual_screen_rect(root)
+        screen_w, screen_h = root.winfo_screenwidth(), root.winfo_screenheight()
+        min_w, min_h = root.minsize()
         match = GEOMETRY_RE.fullmatch(self.settings["window_geometry"] or "")
         if match:
             width, height, x, y = (int(v) for v in match.groups())
-            if (px(440) <= width <= vw and px(560) <= height <= vh
+            if (min_w <= width <= vw and min_h <= height <= vh
                     and vx <= x <= vx + vw - 120 and vy <= y <= vy + vh - 120):
                 root.geometry(f"{width}x{height}+{x}+{y}")
                 return
-        screen_w, screen_h = root.winfo_screenwidth(), root.winfo_screenheight()
-        width, height = min(px(560), screen_w - 40), min(px(780), screen_h - 80)
+        width = min(px(560), screen_w - 40)
+        height = min(self._content_height + px(220), screen_h - 80)
         root.geometry(f"{width}x{height}+{(screen_w - width) // 2}+{max(0, (screen_h - height) // 2 - 20)}")
 
     # -- status ------------------------------------------------------------
@@ -2555,10 +2753,12 @@ class ScreenshotApp:
 
     def _report_error(self, exc_type, value, tb):
         traceback.print_exception(exc_type, value, tb)
-        if self.selector is None:  # don't leave the window hidden after a failed capture
+        if self.selector is None or self.selector.finished:
+            # Never leave the program hidden and "busy" after a failed capture.
+            self.selector = None
             self.busy = False
-            if self.root.state() == "withdrawn" or self._hidden_by_alpha:
-                self._show_window(force=True)
+            if self._hidden:
+                self._restore_windows(captured=False)
         self.set_status(f"Something went wrong: {value}", "error")
 
     # -- folders -----------------------------------------------------------
@@ -2632,27 +2832,45 @@ class ScreenshotApp:
         self.settings["open_editor"] = self.editor_var.get()
         self._save_settings_quietly()
 
-    def _save_settings_quietly(self):
+    def _save_settings_quietly(self, report=True):
+        """Save settings; returns an error message (also shown if report) or None."""
         try:
             self.settings.save()
+            return None
         except OSError as error:
-            self.set_status(f"Couldn't save settings: {error}", "warning")
+            message = f"Couldn't save settings: {error}"
+            if report:
+                self.set_status(message, "warning")
+            return message
 
     # -- region fields -----------------------------------------------------
     def _show_region(self, region):
         for variable, value in zip(self.region_vars, region or ("", "", "", "")):
             variable.set(str(value))
 
+    def _region_from_fields(self):
+        """The typed X/Y/W/H; None when all are empty, ValueError when invalid."""
+        texts = [variable.get().strip() for variable in self.region_vars]
+        if not any(texts):
+            return None
+        try:
+            values = [int(text) for text in texts]
+        except ValueError:
+            raise ValueError("Region values must be whole numbers.") from None
+        if values[2] <= 0 or values[3] <= 0:
+            raise ValueError("Width and height must be greater than 0.")
+        return values
+
     def apply_region(self):
         try:
-            values = [int(v.get().strip()) for v in self.region_vars]
-        except ValueError:
-            self.set_status("Region values must be whole numbers.", "error")
-            return
+            values = self._region_from_fields()
+        except ValueError as error:
+            self.set_status(str(error), "error")
+            return False
+        if values is None:
+            self.set_status("Type X, Y, W and H first.", "error")
+            return False
         x, y, width, height = values
-        if width <= 0 or height <= 0:
-            self.set_status("Width and height must be greater than 0.", "error")
-            return
         vx, vy, vw, vh = virtual_screen_rect(self.root)
         self.settings["last_region"] = values
         self._save_settings_quietly()
@@ -2660,6 +2878,7 @@ class ScreenshotApp:
             self.set_status("Region saved, but it is outside every screen.", "warning")
         else:
             self.set_status(f"Region set to {width} × {height} at ({x}, {y}).", "success")
+        return True
 
     # -- hotkeys -----------------------------------------------------------
     def hotkey_bindings(self):
@@ -2708,37 +2927,79 @@ class ScreenshotApp:
     def trigger(self, action):
         if self.busy or self.settings_dialog is not None:
             return
-        if action == "last" and not self.settings["last_region"]:
-            self._show_window(force=True)
-            self.set_status("There is no region yet. Capture a region first or type one in.", "error")
-            return
+        if action == "last":
+            try:  # numbers typed into the Region fields count even without Apply
+                typed = self._region_from_fields()
+            except ValueError as error:
+                self._bring_to_front()
+                self.set_status(str(error), "error")
+                return
+            if typed and typed != self.settings["last_region"]:
+                self.settings["last_region"] = typed
+                self._save_settings_quietly(report=False)
+            if not self.settings["last_region"]:
+                self._bring_to_front()
+                self.set_status("There is no region yet. Capture a region first or type one in.", "error")
+                return
         self.busy = True
-        self._prev_state = self.root.state()
-        visible = self._prev_state in ("normal", "zoomed")
-        if visible and self._hide_without_focus_change():
-            pass
-        elif visible:
-            self.root.withdraw()
-        delay = self.settings["capture_delay"] * 1000 + (HIDE_DELAY_MS if visible else 50)
+        hidden = self._hide_windows()
+        delay = self.settings["capture_delay"] * 1000 + (HIDE_DELAY_MS if hidden else 50)
         self.root.after(delay, lambda: self._capture(action))
 
-    def _hide_without_focus_change(self):
-        """Make the window invisible without taking focus from the program in front.
+    def _hide_windows(self):
+        """Hide the main window and editors so they don't end up in the capture.
 
-        Used for hotkey captures when the window shouldn't come to the front;
-        withdraw/deiconify would activate it on Windows.  X11 needs a compositor
-        for transparency, so there the window is always withdrawn.
+        When another program is in front, hide without taking focus from it:
+        transparency on Windows/macOS (withdraw/deiconify would activate the
+        window); on X11 minimise when the window shouldn't come to the front.
         """
-        if self.settings["show_after_capture"] or not (IS_WINDOWS or IS_MAC):
-            return False
-        if self.root.focus_displayof() is not None:  # we're in front anyway
-            return False
-        try:
-            self.root.attributes("-alpha", 0.0)
-        except tk.TclError:
-            return False
-        self._hidden_by_alpha = True
-        return True
+        in_front = self.root.focus_displayof() is not None
+        self._hidden = []
+        for window in [self.root] + [editor.win for editor in self.editors]:
+            state = window.state()
+            if state not in ("normal", "zoomed"):
+                continue
+            how = "withdraw"
+            if not in_front and (IS_WINDOWS or IS_MAC):
+                try:
+                    window.attributes("-alpha", 0.0)
+                    how = "alpha"
+                except tk.TclError:
+                    pass
+            elif not in_front and not self.settings["show_after_capture"]:
+                how = "iconify"
+            if how == "withdraw":
+                window.withdraw()
+            elif how == "iconify":
+                window.iconify()
+            self._hidden.append((window, how, state))
+        return bool(self._hidden)
+
+    def _restore_windows(self, captured):
+        """Undo _hide_windows. After a capture the main window may come to the
+        front (setting); after a cancel only the previous state comes back."""
+        for window, how, state in self._hidden:
+            if not window.winfo_exists():
+                continue
+            if how == "alpha":
+                window.attributes("-alpha", 1.0)
+            elif how == "withdraw":
+                window.deiconify()
+                if state == "zoomed":
+                    try:
+                        window.state("zoomed")
+                    except tk.TclError:
+                        pass
+            # "iconify": stays minimised so the program in front keeps focus
+        self._hidden = []
+        if captured and self.settings["show_after_capture"]:
+            self._bring_to_front()
+
+    def _bring_to_front(self):
+        if self.root.state() in ("iconic", "withdrawn"):
+            self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
 
     def _capture(self, action):
         try:
@@ -2754,7 +3015,8 @@ class ScreenshotApp:
             traceback.print_exc()
             self.selector = None
             self.busy = False
-            self._show_window(force=True)
+            self._restore_windows(captured=False)
+            self._bring_to_front()
             self.set_status(f"Capture failed: {error}", "error")
 
     def _region_selected(self, image, region):
@@ -2766,18 +3028,20 @@ class ScreenshotApp:
     def _capture_cancelled(self):
         self.selector = None
         self.busy = False
-        self._show_window()
+        self._restore_windows(captured=False)
         self.set_status("Capture cancelled.", "info")
 
     def _capture_done(self, image):
         self.busy = False
+        self.capture_id += 1
         self.last_image = image
         self.last_path = None
         save_error = clipboard_error = None
         try:
             folder = self._ensure_output_folder()
-            path = unique_path(folder, build_filename(self.settings["file_pattern"],
-                                                      self.settings["image_format"]))
+            name = build_filename(self.settings["file_pattern"], self.settings["image_format"])
+            # Never reuse a file an open editor would save over.
+            path = unique_path(folder, name, taken={editor.path for editor in self.editors})
             save_image(image, path, self.settings["image_format"], self.settings["jpeg_quality"])
             self.last_path = path
             self._remember_folder(self.folder_var.get())
@@ -2787,41 +3051,26 @@ class ScreenshotApp:
         if self.copy_var.get():
             clipboard_error = self.copy_image(image)
             copied = clipboard_error is None
+        settings_error = self._save_settings_quietly(report=False)
 
-        self._show_window()
+        self._restore_windows(captured=True)
         self._schedule_preview()
         self._update_action_buttons()
         size = f"{image.width} × {image.height}"
         if save_error:
             extra = " The image was copied to the clipboard." if copied else ""
-            self.set_status(f"Not saved: {save_error}{extra}", "error")
+            message, kind = f"Not saved: {save_error}{extra}", "error"
         elif clipboard_error:
-            self.set_status(f"Saved {self.last_path} ({size}), but copying failed: {clipboard_error}", "warning")
+            message, kind = f"Saved {self.last_path} ({size}), but copying failed: {clipboard_error}", "warning"
         else:
             extra = " and copied to the clipboard" if copied else ""
-            self.set_status(f"Saved {self.last_path} ({size}){extra}.", "success")
-        self._save_settings_quietly()
+            message, kind = f"Saved {self.last_path} ({size}){extra}.", "success"
+        if settings_error:
+            message += f" {settings_error}"
+            kind = "error" if kind == "error" else "warning"
+        self.set_status(message, kind)
         if self.editor_var.get():
             self.open_editor()
-
-    def _show_window(self, force=False):
-        previous = self._prev_state
-        if self._hidden_by_alpha:
-            self._hidden_by_alpha = False
-            self.root.attributes("-alpha", 1.0)
-            if not force:
-                return
-        if force or previous in ("normal", "zoomed") or self.settings["show_after_capture"]:
-            self.root.deiconify()
-            if previous == "zoomed":
-                try:
-                    self.root.state("zoomed")
-                except tk.TclError:
-                    pass
-            self.root.lift()
-            self.root.focus_force()
-        elif previous == "iconic":
-            self.root.iconify()
 
     def copy_image(self, image):
         """Copy to the clipboard; returns an error message or None."""
@@ -2843,13 +3092,13 @@ class ScreenshotApp:
         canvas.delete("all")
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if self.last_image is None:
-            hotkey = display_hotkey(self.settings["hotkey_region"])
-            canvas.create_text(width / 2, height / 2, justify=tk.CENTER, fill=MUTED, font=UI.font(10),
-                               text=f"No capture yet\nClick Region or press {hotkey}")
+            hotkey = self.settings["hotkey_region"]
+            text = "No capture yet\nClick Region" + (f" or press {display_hotkey(hotkey)}" if hotkey else "")
+            canvas.create_text(width / 2, height / 2, justify=tk.CENTER, fill=MUTED, font=UI.font(10), text=text)
             self.preview_info.configure(text="")
             return
         image_w, image_h = self.last_image.size
-        pad = UI.px(10)
+        pad = UI.px(8)
         scale = min(1.0, (width - 2 * pad) / image_w, (height - 2 * pad) / image_h)
         if scale <= 0:
             return
@@ -2896,15 +3145,15 @@ class ScreenshotApp:
             self.set_status("Take a screenshot first, then edit it.", "info")
             return
         for editor in self.editors:
-            if editor.path is not None and editor.path == self.last_path:
+            if editor.capture_id == self.capture_id:
                 editor.win.deiconify()
                 editor.win.lift()
                 editor.win.focus_force()
                 return
-        self.editors.append(ImageEditor(self, self.last_image, self.last_path))
+        self.editors.append(ImageEditor(self, self.last_image, self.last_path, self.capture_id))
 
-    def editor_saved(self, image, path):
-        if path == self.last_path or self.last_path is None:
+    def editor_saved(self, editor, image, path):
+        if editor.capture_id == self.capture_id:  # only the newest capture is shown here
             self.last_image, self.last_path = image, path
             self._schedule_preview()
             self._update_action_buttons()
