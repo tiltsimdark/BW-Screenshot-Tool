@@ -130,12 +130,14 @@ class ScreenGrab:
         """Cut out an (x, y, width, height) region given in screen coordinates."""
         x, y, width, height = region
         sx, sy = self.scale
-        left = max(0, round((x - self.origin[0]) * sx))
-        top = max(0, round((y - self.origin[1]) * sy))
-        right = min(self.image.width, max(round((x - self.origin[0] + width) * sx), left + 1))
-        bottom = min(self.image.height, max(round((y - self.origin[1] + height) * sy), top + 1))
-        if right <= left or bottom <= top:
+        raw_left, raw_top = (x - self.origin[0]) * sx, (y - self.origin[1]) * sy
+        raw_right, raw_bottom = raw_left + width * sx, raw_top + height * sy
+        if raw_right <= 0 or raw_bottom <= 0 or raw_left >= self.image.width or raw_top >= self.image.height:
             raise ValueError("the region is outside the visible screens")
+        left = min(self.image.width - 1, max(0, round(raw_left)))
+        top = min(self.image.height - 1, max(0, round(raw_top)))
+        right = min(self.image.width, max(round(raw_right), left + 1))  # at least 1 pixel
+        bottom = min(self.image.height, max(round(raw_bottom), top + 1))
         return self.image.crop((left, top, right, bottom))
 
 
@@ -620,13 +622,16 @@ class HotkeyManager:
         return problems
 
     def _poll(self):
-        while True:
-            try:
-                action = self.events.get_nowait()
-            except queue.Empty:
-                break
-            self.callback(action)
-        self._poll_id = self.root.after(50, self._poll)
+        try:
+            while True:
+                try:
+                    action = self.events.get_nowait()
+                except queue.Empty:
+                    break
+                self.callback(action)
+        finally:  # an error in the callback must not stop the hotkeys
+            if self._backend is not None:
+                self._poll_id = self.root.after(50, self._poll)
 
     def stop(self):
         if self._poll_id is not None:
@@ -809,12 +814,22 @@ class Settings:
 
     @staticmethod
     def _writable(path):
-        try:
-            with open(path, "a"):
+        """Whether path can be written for good (a brief lock doesn't count)."""
+        if path.exists() and not os.access(path, os.W_OK):  # e.g. read-only attribute
+            return False
+        if not path.parent.is_dir():
+            return False
+        try:  # e.g. Program Files: files can't be created there
+            with tempfile.TemporaryFile(dir=path.parent):
                 pass
             return True
         except OSError:
             return False
+
+    def save_target(self):
+        """The file the next save will write."""
+        fallback = self._fallback()
+        return fallback if fallback and not self._writable(self.path) else self.path
 
     def _source(self):
         fallback = self._fallback()
@@ -860,7 +875,7 @@ class Settings:
         targets = [self.path] + ([self._fallback()] if self._fallback() else [])
         error = None
         for target in targets:
-            for _ in range(3):
+            for attempt in range(3):
                 try:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     temporary = target.with_name(target.name + ".tmp")
@@ -868,11 +883,12 @@ class Settings:
                     os.replace(temporary, target)
                     self.saved_to = target
                     return
-                except PermissionError as exc:  # often a brief antivirus/OneDrive lock
-                    error = exc
-                    time.sleep(0.05)
                 except OSError as exc:
                     error = exc
+                    # Windows sharing violations (antivirus, OneDrive) pass quickly.
+                    if getattr(exc, "winerror", None) in (32, 33) and attempt < 2:
+                        time.sleep(0.05)
+                        continue
                     break
         raise error
 
@@ -1049,7 +1065,7 @@ def _draw_arrow(draw, start, end, color, width):
     ux, uy = (x1 - x0) / length, (y1 - y0) / length
     base_x, base_y = x1 - ux * head_length, y1 - uy * head_length
     if length > head_length:
-        _draw_polyline(draw, [(x0, y0), (base_x + ux, base_y + uy)], color, width)
+        draw.line([(x0, y0), (base_x + ux, base_y + uy)], fill=color, width=width)
     draw.polygon([(x1, y1),
                   (base_x - uy * head_half, base_y + ux * head_half),
                   (base_x + uy * head_half, base_y - ux * head_half)], fill=color)
@@ -1236,17 +1252,60 @@ def set_window_icon(root):
         pass  # a missing or broken icon must never stop the program
 
 
+def work_area(window, x, y):
+    """(left, top, right, bottom) usable by windows on the monitor at (x, y), or None."""
+    if IS_WINDOWS:
+        try:
+            from ctypes import wintypes
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                            ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+            user32 = ctypes.windll.user32
+            user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+            user32.MonitorFromPoint.restype = wintypes.HANDLE
+            user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
+            monitor = user32.MonitorFromPoint(wintypes.POINT(int(x), int(y)), 2)  # nearest monitor
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                work = info.rcWork  # excludes the taskbar
+                return work.left, work.top, work.right, work.bottom
+        except Exception:
+            pass
+    screen_w, screen_h = window.winfo_screenwidth(), window.winfo_screenheight()
+    monitors = [(0, 0, screen_w, screen_h)]
+    if not IS_MAC:  # Tk on macOS only knows the main display; don't guess there
+        try:
+            import screeninfo
+
+            monitors = [(m.x, m.y, m.width, m.height) for m in screeninfo.get_monitors()] or monitors
+        except Exception:
+            pass
+    for mx, my, mw, mh in monitors:
+        if mx <= x < mx + mw and my <= y < my + mh:
+            return mx, my, mx + mw, my + mh - UI.px(40)  # room for a panel or dock
+    return None
+
+
 def center_window(window, width, height, parent=None):
+    """Place (and if needed shrink) a window so it fits the monitor it opens on."""
     if parent is not None and parent.winfo_viewable():
         x = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
         y = parent.winfo_rooty() + (parent.winfo_height() - height) // 3
+        anchor = (parent.winfo_rootx() + parent.winfo_width() // 2, parent.winfo_rooty() + parent.winfo_height() // 2)
     else:
         x = (window.winfo_screenwidth() - width) // 2
         y = (window.winfo_screenheight() - height) // 3
-    # Keep it on screen, clear of a taskbar at the bottom.
-    vx, vy, vw, vh = virtual_screen_rect(window)
-    x = max(vx, min(x, vx + vw - width))
-    y = max(vy, min(y, vy + vh - height - UI.px(70)))
+        anchor = (window.winfo_screenwidth() // 2, window.winfo_screenheight() // 2)
+    area = work_area(window, *anchor)
+    if area:
+        left, top, right, bottom = area
+        caption = UI.px(32)  # title bar and frame
+        width, height = min(width, right - left), min(height, bottom - top - caption)
+        x = max(left, min(x, right - width))
+        y = max(top, min(y, bottom - height - caption))
     window.geometry(f"{width}x{height}+{x}+{y}")
 
 
@@ -1371,14 +1430,13 @@ class HotkeyEntry(ttk.Entry):
         # macOS reports Command as Meta; on X11, Shift+Alt can produce Meta.
         "Meta_L": "Win" if IS_MAC else "Alt", "Meta_R": "Win" if IS_MAC else "Alt",
     }
-    CHORD_TIMEOUT = 0.5  # seconds a just-released modifier still counts
+    CHORD_TIMEOUT = 0.3  # seconds a just-released modifier still counts
 
     def __init__(self, master, variable, **kwargs):
         super().__init__(master, textvariable=variable, state="readonly", **kwargs)
         self.variable = variable
         self.held = set()  # modifiers that are down
-        self.chord = set()  # modifiers pressed since the last recorded key
-        self._released_at = 0.0
+        self.released = {}  # modifier -> when it was let go
         self._print_pressed = False
         self.bind("<KeyPress>", self._press)
         self.bind("<KeyRelease>", self._release)
@@ -1386,24 +1444,24 @@ class HotkeyEntry(ttk.Entry):
 
     def _reset(self):
         self.held.clear()
-        self.chord.clear()
+        self.released.clear()
         self._print_pressed = False
 
     def _modifiers(self, event):
         # People often let go of Ctrl a moment before Print Screen.
-        if not self.held and time.monotonic() - self._released_at > self.CHORD_TIMEOUT:
-            self.chord.clear()
-        return frozenset(self.held | self.chord | event_modifiers(event.state))
+        now = time.monotonic()
+        recent = {m for m, when in self.released.items() if now - when <= self.CHORD_TIMEOUT}
+        return frozenset(self.held | recent | event_modifiers(event.state))
 
     def _record(self, event, key):
         self.variable.set(hotkey_label(format_hotkey((self._modifiers(event), key))))
-        self.chord = set(self.held)
+        self.released.clear()
 
     def _press(self, event):
         modifier = self.MODIFIER_KEYSYMS.get(event.keysym)
         if modifier:
             self.held.add(modifier)
-            self.chord.add(modifier)
+            self.released.pop(modifier, None)
             return "break"
         if event.keysym in ("BackSpace", "Delete") and not (self.held or event_modifiers(event.state)):
             self.variable.set("")
@@ -1419,7 +1477,7 @@ class HotkeyEntry(ttk.Entry):
         modifier = self.MODIFIER_KEYSYMS.get(event.keysym)
         if modifier:
             self.held.discard(modifier)
-            self._released_at = time.monotonic()
+            self.released[modifier] = time.monotonic()
             return "break"
         if key_from_tk_keysym(event.keysym) == "Print":
             if self._print_pressed:  # already recorded when it was pressed
@@ -1451,6 +1509,7 @@ class RegionSelector:
 
     MAG_RADIUS = 10  # real pixels shown either side of the cursor
     MAG_ZOOM = 8
+    TILE = 512  # size of the undimmed-selection tiles
     HINT = ("Drag to select an area   •   Enter: whole screen   •   "
             "Arrow keys: move 1 px (Shift: 10 px)   •   Esc / right-click: cancel")
 
@@ -1498,19 +1557,18 @@ class RegionSelector:
 
         self.bright = ImageTk.PhotoImage(image, master=win)
         dim = settings["dim_percent"] / 100
-        self.selection_photo = None
+        self.selection_tiles = None
         if dim > 0:
             dark = Image.blend(image, Image.new("RGB", image.size, "black"), dim)
             self.background = ImageTk.PhotoImage(dark, master=win)
-            # A transparent full-size layer; only the strips that change are
-            # copied in or erased while dragging, which keeps 4K screens smooth.
-            self.selection_photo = tk.PhotoImage(master=win, width=width, height=height)
+            # The undimmed selection lives in transparent tiles over the dimmed
+            # image; only the strips that change are copied in or erased while
+            # dragging (small tiles keep that cheap on 4K screens).
+            self.selection_tiles = {}
             self.eraser = tk.PhotoImage(master=win, width=1, height=1)
         else:
             self.background = self.bright
-        canvas.create_image(0, 0, anchor="nw", image=self.background)
-        if self.selection_photo is not None:
-            canvas.create_image(0, 0, anchor="nw", image=self.selection_photo)
+        self.background_item = canvas.create_image(0, 0, anchor="nw", image=self.background)
 
         line_state = "normal" if settings["show_crosshair"] else "hidden"
         cross, cross_width = settings["crosshair_color"], settings["crosshair_width"]
@@ -1677,7 +1735,7 @@ class RegionSelector:
             left, top, width, height = self._current_region()
             self._draw_border(left, top, left + width, top + height)
             self._paint_selection((left, top, left + width, top + height))
-            self._draw_size_label(f"{width} × {height}", left, top)
+            self._draw_size_label(f"{width} × {height}", left, top, left + width, top + height)
         else:
             for item in self.border + [self.size_bg, self.size_text]:
                 canvas.itemconfigure(item, state="hidden")
@@ -1699,20 +1757,54 @@ class RegionSelector:
 
     def _paint_selection(self, rect):
         """Show rect undimmed, updating only the parts that changed."""
-        photo = self.selection_photo
-        if photo is None or rect == self._painted:
+        if self.selection_tiles is None or rect == self._painted:
             return
         old, self._painted = self._painted, rect
         if old is not None:
-            for left, top, right, bottom in (rect_minus(old, rect) if rect else [old]):
-                photo.tk.call(photo.name, "copy", self.eraser.name, "-to", left, top, right, bottom,
-                              "-compositingrule", "set")
+            for box in (rect_minus(old, rect) if rect else [old]):
+                self._paint_box(box, reveal=False)
         if rect is not None:
-            for left, top, right, bottom in (rect_minus(rect, old) if old else [rect]):
-                photo.tk.call(photo.name, "copy", str(self.bright), "-from", left, top, right, bottom,
-                              "-to", left, top)
+            for box in (rect_minus(rect, old) if old else [rect]):
+                self._paint_box(box, reveal=True)
 
-    def _draw_size_label(self, text, left, top):
+    def _paint_box(self, box, reveal):
+        left, top, right, bottom = box
+        size = self.TILE
+        for column in range(left // size, (right - 1) // size + 1):
+            for row in range(top // size, (bottom - 1) // size + 1):
+                tile = self.selection_tiles.get((column, row))
+                if tile is None:
+                    if not reveal:
+                        continue
+                    tile = self._new_tile(column, row)
+                x0, y0 = column * size, row * size
+                l, t = max(left, x0), max(top, y0)
+                r, b = min(right, x0 + size), min(bottom, y0 + size)
+                if reveal:
+                    tile.tk.call(tile.name, "copy", str(self.bright), "-from", l, t, r, b, "-to", l - x0, t - y0)
+                else:
+                    tile.tk.call(tile.name, "copy", self.eraser.name, "-to", l - x0, t - y0, r - x0, b - y0,
+                                 "-compositingrule", "set")
+
+    def _new_tile(self, column, row):
+        size = self.TILE
+        tile = tk.PhotoImage(master=self.win, width=min(size, self.width - column * size),
+                             height=min(size, self.height - row * size))
+        item = self.canvas.create_image(column * size, row * size, anchor="nw", image=tile)
+        self.canvas.tag_raise(item, self.background_item)
+        self.selection_tiles[(column, row)] = tile
+        return tile
+
+    def _label_monitor(self, left, top, right, bottom):
+        monitor = self._monitor_at(left, top)
+        if monitor in self.monitors:
+            return monitor
+        # The corner is in a gap between monitors: use the highest one the selection touches.
+        touching = [m for m in self.monitors
+                    if m[0] < right and m[0] + m[2] > left and m[1] < bottom and m[1] + m[3] > top]
+        return min(touching, key=lambda m: m[1]) if touching else monitor
+
+    def _draw_size_label(self, text, left, top, right, bottom):
         canvas = self.canvas
         canvas.itemconfigure(self.size_text, text=text, state="normal")
         canvas.coords(self.size_text, 0, 0)
@@ -1720,10 +1812,10 @@ class RegionSelector:
         label_w, label_h = x1 - x0, y1 - y0
         pad = UI.px(4)
         gap = self.settings["selection_width"] + pad
-        mx, my, mw, _ = self._monitor_at(left, top)  # keep the label on a visible monitor
-        tx = max(mx, min(left, mx + mw - label_w - 2 * pad))
+        mx, my, mw, _ = self._label_monitor(left, top, right, bottom)  # keep the label visible
+        tx = max(mx, min(max(left, mx), mx + mw - label_w - 2 * pad))
         above = top - label_h - gap - pad
-        ty = above if above >= my else top + gap + pad
+        ty = above if above >= my else max(top, my) + gap + pad
         canvas.coords(self.size_text, tx + pad, ty)
         canvas.coords(self.size_bg, tx, ty - pad / 2, tx + label_w + 2 * pad, ty + label_h + pad / 2)
         canvas.itemconfigure(self.size_bg, state="normal")
@@ -1763,7 +1855,7 @@ class RegionSelector:
             draw = ImageDraw.Draw(zoomed)
             centre = radius * zoom
             cell_w, cell_h = zoom * max(1, round(sx)), zoom * max(1, round(sy))  # one screen point
-            mid_x, mid_y = centre + zoom // 2, centre + zoom // 2
+            mid_x, mid_y = centre + cell_w // 2, centre + cell_h // 2
             cross = self.settings["crosshair_color"]
             draw.line([(0, mid_y), (centre - 1, mid_y)], fill=cross)
             draw.line([(centre + cell_w, mid_y), (self.mag_size, mid_y)], fill=cross)
@@ -1857,6 +1949,7 @@ class ImageEditor:
         self._hints = {tool: hint for tool, _, _, hint in self.TOOLS}
 
         win = self.win = tk.Toplevel(app.root)
+        win.withdraw()  # shown once it has its final size and position
         win.configure(bg=BG)
         self.tool = tk.StringVar(value="rect")
         self.color = tk.StringVar(value=app.settings["editor_color"])
@@ -1865,6 +1958,7 @@ class ImageEditor:
 
         self._build()
         self._fit_window()
+        win.deiconify()
         self._update_title()
         watch(self.tool, win, self._update_status)
         watch(self.color, win, self._style_changed)
@@ -2020,7 +2114,11 @@ class ImageEditor:
             left, right = sorted((x0, x1))
             top, bottom = sorted((y0, y1))
             inset = drag["width"] / 2
-            coords = [left + inset, top + inset, max(left + inset, right - inset), max(top + inset, bottom - inset)]
+            if right - left > 2 * inset:
+                left, right = left + inset, right - inset
+            if bottom - top > 2 * inset:
+                top, bottom = top + inset, bottom - inset
+            coords = [left, top, right, bottom]
         elif len(coords) == 2:
             coords *= 2
         self.canvas.coords(drag["item"], *coords)
@@ -2202,12 +2300,13 @@ class ImageEditor:
             self.tool.set(tool)
 
     def _on_shortcut(self, event):
-        if isinstance(event.widget, tk.Entry):  # the text field keeps its own shortcuts
-            return None
+        key = event.keysym.lower()
+        if type(event.widget) is tk.Entry and key in ("z", "y", "c"):
+            return None  # undo/copy inside the text being typed
         actions = {("z", False): self.undo, ("z", True): self.redo, ("y", False): self.redo,
                    ("s", False): self.save, ("s", True): self.save_as,
                    ("c", False): self.copy, ("w", False): self.close}
-        action = actions.get((event.keysym.lower(), bool(event.state & 0x1)))
+        action = actions.get((key, bool(event.state & 0x1)))
         if action is None:
             return None
         action()
@@ -2281,7 +2380,6 @@ class SettingsDialog:
         win.title(f"Settings - {APP_NAME}")
         win.configure(bg=BG)
         win.transient(app.root)
-        win.resizable(False, False)
 
         self.vars = {}
         for key in ("master_folder", "file_pattern", "selection_color", "crosshair_color"):
@@ -2299,6 +2397,11 @@ class SettingsDialog:
 
         outer = ttk.Frame(win, padding=UI.px(12))
         outer.pack(fill=tk.BOTH, expand=True)
+        # Buttons first (at the bottom) so they stay visible on short screens.
+        buttons = ttk.Frame(outer)
+        buttons.pack(side=tk.BOTTOM, fill=tk.X, pady=(UI.px(8), 0))
+        ttk.Label(outer, textvariable=self.error, style="Error.TLabel", wraplength=UI.px(480)).pack(
+            side=tk.BOTTOM, fill=tk.X, pady=(UI.px(8), 0))
         notebook = ttk.Notebook(outer)
         notebook.pack(fill=tk.BOTH, expand=True)
         self._general_tab(notebook)
@@ -2306,10 +2409,6 @@ class SettingsDialog:
         self._output_tab(notebook)
         self._hotkeys_tab(notebook)
 
-        ttk.Label(outer, textvariable=self.error, style="Error.TLabel", wraplength=UI.px(480)).pack(
-            fill=tk.X, pady=(UI.px(8), 0))
-        buttons = ttk.Frame(outer)
-        buttons.pack(fill=tk.X, pady=(UI.px(8), 0))
         ttk.Button(buttons, text="Reset to defaults", command=self.reset).pack(side=tk.LEFT)
         ttk.Button(buttons, text="Save", style="Accent.TButton", command=self.save).pack(side=tk.RIGHT)
         ttk.Button(buttons, text="Cancel", command=self.cancel).pack(side=tk.RIGHT, padx=(0, UI.px(6)))
@@ -2317,6 +2416,8 @@ class SettingsDialog:
         win.protocol("WM_DELETE_WINDOW", self.cancel)
         win.bind("<Escape>", lambda e: self.cancel())
         win.update_idletasks()
+        win.resizable(True, True)
+        win.minsize(min(win.winfo_reqwidth(), UI.px(520)), min(win.winfo_reqheight(), UI.px(400)))
         center_window(win, win.winfo_reqwidth(), win.winfo_reqheight(), app.root)
         self._grab()
         win.focus_force()
@@ -2368,7 +2469,7 @@ class SettingsDialog:
         ttk.Label(delay, text="seconds (time to open menus before the screen is frozen)",
                   style="Muted.TLabel").pack(side=tk.LEFT, padx=(px(6), 0))
 
-        ttk.Label(tab, text=f"Settings file: {self.app.settings.saved_to}", style="Muted.TLabel",
+        ttk.Label(tab, text=f"Settings file: {self.app.settings.save_target()}", style="Muted.TLabel",
                   wraplength=px(460), justify=tk.LEFT).grid(row=8, column=0, columnspan=3, sticky="w", pady=(px(16), 0))
 
         def update_example():
@@ -2412,7 +2513,7 @@ class SettingsDialog:
         dim_label.pack(side=tk.LEFT)
 
         ttk.Label(tab, text="Preview", style="Section.TLabel").grid(row=8, column=0, columnspan=3, sticky="w")
-        self.preview = tk.Canvas(tab, width=px(300), height=px(130), highlightthickness=1,
+        self.preview = tk.Canvas(tab, width=px(300), height=px(110), highlightthickness=1,
                                  highlightbackground=BORDER, bg=BG)
         self.preview.grid(row=9, column=0, columnspan=3, sticky="w", pady=(px(6), 0))
 
@@ -2427,7 +2528,7 @@ class SettingsDialog:
     def _draw_selection_preview(self):
         canvas, px = self.preview, UI.px
         canvas.delete("all")
-        width, height = px(300), px(130)
+        width, height = px(300), px(110)
 
         def shade(color, amount):
             red, green, blue = (int(color[i:i + 2], 16) for i in (1, 3, 5))
@@ -2594,6 +2695,7 @@ class ScreenshotApp:
         self.hotkey_problems = []
         self._local_bindings = []
         self._hidden = []  # (window, how it was hidden, previous state) during a capture
+        self._focus = ""
         self._preview_id = None
         self.preview_photo = None
 
@@ -2713,9 +2815,16 @@ class ScreenshotApp:
         self._update_action_buttons()
 
         root.update_idletasks()
-        self._content_height = root.winfo_reqheight()
-        root.minsize(min(px(440), root.winfo_screenwidth() - 40),
-                     min(self._content_height, root.winfo_screenheight() - 80))
+        self._content_width, self._content_height = root.winfo_reqwidth(), root.winfo_reqheight()
+        available_w, available_h = self._available_size()
+        root.minsize(min(self._content_width, available_w), min(self._content_height, available_h))
+
+    def _available_size(self):
+        """Room for the main window on the primary monitor (minus taskbar and title bar)."""
+        screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        left, top, right, bottom = (work_area(self.root, screen_w // 2, screen_h // 2)
+                                    or (0, 0, screen_w, screen_h - UI.px(40)))
+        return right - left - UI.px(16), bottom - top - UI.px(40)
 
     def _card(self, parent, title, expand=False, note=None):
         frame = tk.Frame(parent, bg=CARD, highlightthickness=1, highlightbackground=BORDER,
@@ -2742,14 +2851,18 @@ class ScreenshotApp:
                     and vx <= x <= vx + vw - 120 and vy <= y <= vy + vh - 120):
                 root.geometry(f"{width}x{height}+{x}+{y}")
                 return
-        width = min(px(560), screen_w - 40)
-        height = min(self._content_height + px(220), screen_h - 80)
+        available_w, available_h = self._available_size()
+        width = min(max(px(560), self._content_width), available_w)
+        height = min(self._content_height + px(220), available_h)
         root.geometry(f"{width}x{height}+{(screen_w - width) // 2}+{max(0, (screen_h - height) // 2 - 20)}")
 
     # -- status ------------------------------------------------------------
     def set_status(self, message, kind="info"):
         background, foreground = STATUS_COLORS[kind]
-        self.status.configure(text=message, bg=background, fg=foreground)
+        try:
+            self.status.configure(text=message, bg=background, fg=foreground)
+        except tk.TclError:  # the window is being closed
+            pass
 
     def _report_error(self, exc_type, value, tb):
         traceback.print_exception(exc_type, value, tb)
@@ -2927,6 +3040,8 @@ class ScreenshotApp:
     def trigger(self, action):
         if self.busy or self.settings_dialog is not None:
             return
+        if self.root.tk.call("grab", "current"):  # a file chooser or question is open
+            return
         if action == "last":
             try:  # numbers typed into the Region fields count even without Apply
                 typed = self._region_from_fields()
@@ -2949,51 +3064,58 @@ class ScreenshotApp:
     def _hide_windows(self):
         """Hide the main window and editors so they don't end up in the capture.
 
-        When another program is in front, hide without taking focus from it:
-        transparency on Windows/macOS (withdraw/deiconify would activate the
-        window); on X11 minimise when the window shouldn't come to the front.
+        When another program is in front, Windows/macOS hide them by making
+        them transparent, so that program keeps the focus (withdraw/deiconify
+        would activate ours).  X11 needs a compositor for that, so there they
+        are always withdrawn.
         """
-        in_front = self.root.focus_displayof() is not None
+        self._focus = str(self.root.tk.call("focus"))  # "" when another program is in front
         self._hidden = []
         for window in [self.root] + [editor.win for editor in self.editors]:
             state = window.state()
             if state not in ("normal", "zoomed"):
                 continue
             how = "withdraw"
-            if not in_front and (IS_WINDOWS or IS_MAC):
+            if not self._focus and (IS_WINDOWS or IS_MAC):
                 try:
                     window.attributes("-alpha", 0.0)
                     how = "alpha"
                 except tk.TclError:
                     pass
-            elif not in_front and not self.settings["show_after_capture"]:
-                how = "iconify"
             if how == "withdraw":
                 window.withdraw()
-            elif how == "iconify":
-                window.iconify()
             self._hidden.append((window, how, state))
         return bool(self._hidden)
 
     def _restore_windows(self, captured):
         """Undo _hide_windows. After a capture the main window may come to the
-        front (setting); after a cancel only the previous state comes back."""
-        for window, how, state in self._hidden:
+        front (setting); otherwise focus returns to where it was."""
+        hidden, self._hidden = self._hidden, []
+        restored = []
+        for window, how, state in hidden:
             if not window.winfo_exists():
                 continue
             if how == "alpha":
                 window.attributes("-alpha", 1.0)
-            elif how == "withdraw":
-                window.deiconify()
-                if state == "zoomed":
-                    try:
-                        window.state("zoomed")
-                    except tk.TclError:
-                        pass
-            # "iconify": stays minimised so the program in front keeps focus
-        self._hidden = []
+                continue
+            window.deiconify()
+            if state == "zoomed":
+                try:
+                    window.state("zoomed")
+                except tk.TclError:
+                    pass
+            restored.append(window)
         if captured and self.settings["show_after_capture"]:
             self._bring_to_front()
+        elif self._focus:  # we were in front: the same window and field get the focus back
+            try:
+                self.root.tk.call("raise", self.root.tk.call("winfo", "toplevel", self._focus))
+                self.root.tk.call("focus", "-force", self._focus)
+            except tk.TclError:
+                pass
+        else:  # another program was in front: stay behind it
+            for window in restored:
+                window.lower()
 
     def _bring_to_front(self):
         if self.root.state() in ("iconic", "withdrawn"):
@@ -3166,6 +3288,8 @@ class ScreenshotApp:
 
     # -- settings ----------------------------------------------------------
     def open_settings(self):
+        if self.busy:  # e.g. macOS Preferences shortcut during a capture
+            return
         if self.settings_dialog is not None:
             self.settings_dialog.win.lift()
             return
@@ -3183,6 +3307,8 @@ class ScreenshotApp:
 
     # -- shutdown ----------------------------------------------------------
     def quit(self):
+        if self.selector is not None and not self.selector.finished:
+            self.selector.cancel()
         for editor in list(self.editors):
             if not editor.close():
                 return

@@ -321,6 +321,9 @@ class ScreenGrabTests(unittest.TestCase):
         self.assertEqual(grab.crop((90, 90, 50, 50)).size, (10, 10))
         with self.assertRaises(ValueError):
             grab.crop((500, 500, 10, 10))
+        for offscreen in ((-1500, 20, 800, 30), (10, -900, 30, 400)):  # left of / above every screen
+            with self.assertRaises(ValueError):
+                grab.crop(offscreen)
 
     def test_tiny_region_on_downscaled_grab_is_at_least_one_pixel(self):
         grab = tool.ScreenGrab(self._numbered(75, 75), (0, 0), (100, 100))
