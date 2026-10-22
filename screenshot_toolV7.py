@@ -88,8 +88,13 @@ def enable_dpi_awareness():
     """
     if not IS_WINDOWS:
         return
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor aware
+    try:  # Windows 10 1703+: per-monitor v2
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return
+    except Exception:
+        pass
+    try:  # Windows 8.1+: per-monitor
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
         try:
             ctypes.windll.user32.SetProcessDPIAware()
@@ -138,8 +143,10 @@ def grab_screens(root):
     """Capture every monitor in one image."""
     if IS_WINDOWS:
         image = ImageGrab.grab(all_screens=True)
-        x, y, _, _ = _windows_virtual_screen()
-        return ScreenGrab(image.convert("RGB"), (x, y), image.size)
+        # Pillow always returns real pixels; the metrics are in Tk's units, which
+        # differ if DPI awareness couldn't be enabled (then ScreenGrab scales).
+        x, y, width, height = _windows_virtual_screen()
+        return ScreenGrab(image.convert("RGB"), (x, y), (width, height))
     image = ImageGrab.grab()
     size = (root.winfo_screenwidth(), root.winfo_screenheight())
     return ScreenGrab(image.convert("RGB"), (0, 0), size)
@@ -159,21 +166,22 @@ def get_monitors(grab):
     return monitors or [everything]
 
 
-def copy_image_to_clipboard(image):
+def copy_image_to_clipboard(image, owner=None):
+    """owner: a window handle (Windows) that owns the clipboard data."""
     if IS_WINDOWS:
-        _copy_image_windows(image)
+        _copy_image_windows(image, owner)
     elif IS_MAC:
         _copy_image_mac(image)
     else:
         _copy_image_linux(image)
 
 
-def _copy_image_windows(image):
+def _copy_image_windows(image, owner=None):
     from ctypes import wintypes
 
     buffer = io.BytesIO()
-    image.convert("RGB").save(buffer, "BMP")
-    data = buffer.getvalue()[14:]  # CF_DIB is a BMP without its file header
+    image.convert("RGB").save(buffer, "DIB")
+    data = buffer.getvalue()
 
     user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
     kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
@@ -187,7 +195,7 @@ def _copy_image_windows(image):
     user32.SetClipboardData.restype = wintypes.HANDLE
 
     for _ in range(10):  # another program may be holding the clipboard
-        if user32.OpenClipboard(None):
+        if user32.OpenClipboard(owner):
             break
         time.sleep(0.05)
     else:
@@ -198,6 +206,9 @@ def _copy_image_windows(image):
         if not handle:
             raise MemoryError("not enough memory to copy the image")
         pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            kernel32.GlobalFree(handle)
+            raise MemoryError("not enough memory to copy the image")
         ctypes.memmove(pointer, data, len(data))
         kernel32.GlobalUnlock(handle)
         if not user32.SetClipboardData(8, handle):  # CF_DIB
@@ -245,7 +256,7 @@ def open_path(path):
 
 def reveal_in_folder(path):
     """Show a file selected in the system file manager."""
-    path = os.path.normpath(str(path))
+    path = os.path.abspath(str(path))
     if IS_WINDOWS:
         subprocess.Popen(f'explorer /select,"{path}"')
     elif IS_MAC:
@@ -297,7 +308,25 @@ _KEY_LOOKUP.update({
     "ins": "Insert", "del": "Delete", "break": "Pause",
 })
 _TK_KEYSYM_LOOKUP = {spec[2].lower(): name for name, spec in KEY_TABLE.items()}
-_TK_KEYSYM_LOOKUP["sys_req"] = "Print"  # X11 reports Shift/Alt+Print as Sys_Req
+# Other keysyms some keys produce while modifiers are held: X11 reports
+# Shift/Alt+Print as Sys_Req, and Ctrl+Pause is Cancel (Windows) or Break (X11).
+KEYSYM_VARIANTS = {"Print": ("Sys_Req",), "Pause": ("Cancel", "Break")}
+for _key, _variants in KEYSYM_VARIANTS.items():
+    for _variant in _variants:
+        _TK_KEYSYM_LOOKUP[_variant.lower()] = _key
+
+
+def event_modifiers(state):
+    """Ctrl/Alt/Shift held during a Tk key event."""
+    modifiers = set()
+    if state & 0x1:
+        modifiers.add("Shift")
+    if state & 0x4:
+        modifiers.add("Ctrl")
+    if (IS_WINDOWS and state & 0x20000) or (IS_MAC and state & 0x10) or \
+            (not IS_WINDOWS and not IS_MAC and state & 0x8):
+        modifiers.add("Alt")
+    return modifiers
 
 
 def parse_hotkey(text):
@@ -402,26 +431,35 @@ class _WindowsHotkeys:
     def _run(self):
         from ctypes import wintypes
 
-        user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
-        user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
-        user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
-        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
-                                       wintypes.UINT, wintypes.UINT]
-        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
-        self._thread_id = kernel32.GetCurrentThreadId()
         ids = {}
         try:
+            user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+            user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+            user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                           wintypes.UINT, wintypes.UINT]
+            kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+            self._thread_id = kernel32.GetCurrentThreadId()
             for hotkey_id, (action, parsed) in enumerate(self._parsed.items(), start=1):
                 modifiers, key = parsed
                 flags = self.MOD_NOREPEAT
                 for modifier in modifiers:
                     flags |= self.MODIFIER_FLAGS[modifier]
-                if user32.RegisterHotKey(None, hotkey_id, flags, KEY_TABLE[key][0]):
+                virtual_key = KEY_TABLE[key][0]
+                if key == "Pause" and "Ctrl" in modifiers:
+                    virtual_key = 0x03  # Windows turns Ctrl+Pause into VK_CANCEL
+                if user32.RegisterHotKey(None, hotkey_id, flags, virtual_key):
                     ids[hotkey_id] = action
                     self.registered[action] = format_hotkey(parsed)
                 else:
                     self.errors.append(
                         f"{display_hotkey(format_hotkey(parsed))} is already used by another program")
+        except Exception as error:
+            for hotkey_id in ids:
+                user32.UnregisterHotKey(None, hotkey_id)
+            self.registered.clear()
+            self.errors.append(f"global hotkeys are unavailable: {error}")
+            return
         finally:
             self._ready.set()
         message = wintypes.MSG()
@@ -467,10 +505,11 @@ class _PynputHotkeys:
         except Exception as error:
             return {}, [f"global hotkeys are unavailable: {error}"]
         self._canonical = getattr(listener, "canonical", lambda key: key)
-        self._aliases = {}
-        if hasattr(keyboard.Key, "print_screen"):  # X11 sends Sys_Req for Shift/Alt+Print
-            self._aliases[self._canonical(keyboard.KeyCode.from_vk(0xFF15))] = \
-                self._canonical(keyboard.Key.print_screen)
+        self._aliases = {}  # X11 keysyms Sys_Req (Shift/Alt+Print) and Break (Ctrl+Pause)
+        for keysym, name in ((0xFF15, "print_screen"), (0xFF6B, "pause")):
+            if hasattr(keyboard.Key, name):
+                self._aliases[self._canonical(keyboard.KeyCode.from_vk(keysym))] = \
+                    self._canonical(getattr(keyboard.Key, name))
         self._modifiers = {}
         for modifier, names in self.MODIFIER_KEYS:
             for name in names:
@@ -577,6 +616,11 @@ class HotkeyManager:
         if self._poll_id is not None:
             self.root.after_cancel(self._poll_id)
             self._poll_id = None
+        while True:  # drop presses that arrived just before stopping
+            try:
+                self.events.get_nowait()
+            except queue.Empty:
+                break
         if self._backend is not None:
             try:
                 self._backend.stop()
@@ -1287,14 +1331,7 @@ class HotkeyEntry(ttk.Entry):
         self.bind("<FocusOut>", lambda e: self.held.clear())
 
     def _modifiers(self, event):
-        modifiers = set(self.held)
-        if event.state & 0x1:
-            modifiers.add("Shift")
-        if event.state & 0x4:
-            modifiers.add("Ctrl")
-        if (IS_WINDOWS and event.state & 0x20000) or (not IS_WINDOWS and not IS_MAC and event.state & 0x8):
-            modifiers.add("Alt")
-        return frozenset(modifiers)
+        return frozenset(self.held | event_modifiers(event.state))
 
     def _press(self, event):
         modifier = self.MODIFIER_KEYSYMS.get(event.keysym)
@@ -2644,15 +2681,16 @@ class ScreenshotApp:
                 continue
             if not parsed:
                 continue
-            sequence = tk_sequence(parsed, release=IS_WINDOWS and parsed[1] == "Print")
+            modifiers, key = parsed
+            sequence = tk_sequence(parsed, release=IS_WINDOWS and key == "Print")
             if not sequence:
                 continue
-            sequences = [sequence]
-            if parsed[1] == "Print" and not IS_WINDOWS:
-                sequences.append(sequence.replace("-Print>", "-Sys_Req>"))
+            keysym = KEY_TABLE[key][2]
+            sequences = [sequence] + [sequence.replace(f"-{keysym}>", f"-{variant}>")
+                                      for variant in KEYSYM_VARIANTS.get(key, ())]
             for sequence in sequences:
                 try:
-                    self.root.bind(sequence, lambda e, a=action: self.trigger(a))
+                    self.root.bind(sequence, lambda e, a=action, m=modifiers: self._local_hotkey(e, a, m))
                     self._local_bindings.append(sequence)
                 except tk.TclError:
                     pass
@@ -2660,6 +2698,11 @@ class ScreenshotApp:
             self.tiles[action].set_subtitle(display_hotkey(self.settings[key]))
         if self.hotkey_problems:
             self.set_status("Hotkeys: " + "; ".join(self.hotkey_problems), "warning")
+
+    def _local_hotkey(self, event, action, modifiers):
+        # Tk also matches when extra modifiers are held (e.g. Alt+Print).
+        if event_modifiers(event.state) == set(modifiers):
+            self.trigger(action)
 
     # -- capturing ---------------------------------------------------------
     def trigger(self, action):
@@ -2783,7 +2826,7 @@ class ScreenshotApp:
     def copy_image(self, image):
         """Copy to the clipboard; returns an error message or None."""
         try:
-            copy_image_to_clipboard(image)
+            copy_image_to_clipboard(image, self.root.winfo_id() if IS_WINDOWS else None)
             return None
         except Exception as error:
             return str(error) or error.__class__.__name__

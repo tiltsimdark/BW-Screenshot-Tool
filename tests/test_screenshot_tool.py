@@ -64,6 +64,17 @@ class HotkeyTests(unittest.TestCase):
         self.assertEqual(tool.key_from_tk_keysym("F5"), "F5")
         self.assertIsNone(tool.key_from_tk_keysym("Shift_L"))
 
+    def test_keysym_variants_while_modifiers_are_held(self):
+        self.assertEqual(tool.key_from_tk_keysym("Cancel"), "Pause")  # Ctrl+Pause on Windows
+        self.assertEqual(tool.key_from_tk_keysym("Break"), "Pause")  # Ctrl+Pause on X11
+
+    def test_event_modifiers(self):
+        self.assertEqual(tool.event_modifiers(0), set())
+        self.assertEqual(tool.event_modifiers(0x1 | 0x4), {"Shift", "Ctrl"})
+        alt = 0x20000 if tool.IS_WINDOWS else (0x10 if tool.IS_MAC else 0x8)
+        self.assertEqual(tool.event_modifiers(alt), {"Alt"})
+        self.assertEqual(tool.event_modifiers(0x2), set())  # Caps Lock is ignored
+
     def test_windows_virtual_key_codes(self):
         self.assertEqual(tool.KEY_TABLE["Print"][0], 0x2C)
         self.assertEqual(tool.KEY_TABLE["F1"][0], 0x70)
